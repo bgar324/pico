@@ -1,0 +1,15 @@
+node_modules/
+dist/
+release/
+build/
+Evidence/
+.agents/
+.DS_Store
+.env
+.env.*
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision

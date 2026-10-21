@@ -1,0 +1,37 @@
+{
+  "name": "pico",
+  "version": "1.0.0",
+  "description": "A local desktop workspace for Oh My Pi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bgar324/pico.git"
+  },
+  "private": true,
+  "main": "dist/main.cjs",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "icon": "swift scripts/make-icon.swift && iconutil -c icns build/Pico.iconset -o assets/Pico.icns && cp build/Pico.iconset/icon_512x512@2x.png assets/Pico.png",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "start": "npm run build && electron .",
+    "package": "npm run icon && npm run build && node scripts/package.mjs",
+    "verify": "npm run typecheck && npm test && npm run build",
+    "smoke": "npm run build && node scripts/smoke.mjs",
+    "performance": "node scripts/performance.mjs"
+  },
+  "dependencies": {
+    "@tabler/icons": "3.49.0",
+    "dompurify": "3.4.17",
+    "marked": "18.1.1",
+    "motion": "14.4.0"
+  },
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "@types/node": "^24.0.0",
+    "electron": "44.7.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3"
+  }
+}
