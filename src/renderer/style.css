@@ -177,7 +177,8 @@ details > summary::marker { content:''; }
 .sent-message-edit-footer { margin-top:10px; }
 .sent-message-edit-help { margin:0 0 8px; font-size:12px; line-height:18px; }
 .sent-message-edit-actions { display:flex; justify-content:flex-end; gap:6px; }
-.agent-message { padding:0; }
+.agent-message { padding:0; margin-bottom:8px; }
+.agent-message > .markdown > :last-child { margin-bottom:0; }
 .reasoning { font-size:13px; line-height:1.65; color:var(--muted); margin-bottom:12px; }
 .markdown .math-inline { white-space:normal; overflow-wrap:normal; }
 .markdown .math-display { display:block; max-width:100%; overflow-x:auto; overflow-y:hidden; padding-block:2px; }
@@ -539,11 +540,7 @@ details[open] > summary > .disclosure-chevron { transform:rotate(90deg); }
 .message-images img { display:block; width:auto; max-width:min(100%,420px); max-height:300px; object-fit:contain; border-radius:8px; }
 .message > .markdown[hidden] + .message-images { margin-top:0; }
 .message-actions { display:flex; align-items:center; gap:4px; margin-top:6px; }
-.response-actions { margin:8px 0 0; width:fit-content; }
-/* Advisor follows the response controls without stacking paragraph and turn gaps. */
-.agent-message:has(+ .message .advisor-group) { margin-bottom:8px; }
-.agent-message:has(+ .message .advisor-group) > .markdown > :last-child { margin-bottom:0; }
-.agent-message:has(+ .message .advisor-group) > .response-actions { margin-top:0; }
+.response-actions { margin:0; width:fit-content; }
 .response-actions .copy-message { opacity:0; transition:opacity var(--motion-fast) var(--motion-ease); }
 .agent-message:hover > .response-actions .copy-message,.response-actions:has(.copy-message:focus-visible) .copy-message { opacity:1; }
 @media(hover:none) { .response-actions .copy-message { opacity:1; } }

@@ -215,6 +215,40 @@ function checkTodoActivity(view: Conversation): string {
   return 'Todo-only, mixed, and orphan activity stays hidden without altering real tools or ordinary prose.';
 }
 
+async function checkTranscriptSpacing(view: Conversation): Promise<string> {
+  const answer: ChatMessage = { id: 'spacing-prose', role: 'assistant', text: 'First paragraph.\n\nFinal paragraph.', thinking: '', error: null, isStreaming: false, toolIDs: [] };
+  const execution: ChatMessage = { ...answer, id: 'spacing-tools', text: '', toolIDs: ['spacing-eval'] };
+  for (const separateToolMessage of [false, true]) for (const busy of [false, true]) {
+    const runtime: RuntimeSnapshot = {
+      ...source(`spacing-${separateToolMessage}-${busy}`),
+      status: { kind: 'ready', activity: busy ? 'running' : 'idle' },
+      messages: separateToolMessage ? [answer, execution] : [{ ...answer, toolIDs: execution.toolIDs }],
+      tools: [{ id: 'spacing-eval', name: 'eval', target: 'Inspecting the project', detail: '', output: '', state: busy ? 'running' : 'succeeded', startedAt: 1, endedAt: busy ? null : 2 }],
+    };
+    view.update(runtime, runtime.id); await frame();
+    const paragraph = view.content.querySelector<HTMLElement>('[data-message-id="spacing-prose"] > .markdown:not(.reasoning) > :last-child');
+    const summary = view.content.querySelector<HTMLElement>('.activity-group > summary');
+    const actions = view.content.querySelector<HTMLElement>('.response-actions');
+    if (!paragraph || !summary) throw new Error('Missing text-to-tool spacing fixture.');
+    const textBottom = paragraph.getBoundingClientRect().bottom, toolTop = summary.getBoundingClientRect().top;
+    const controlsHeight = actions?.getBoundingClientRect().height ?? 0;
+    verify(toolTop - textBottom <= controlsHeight + 8 && toolTop - textBottom >= controlsHeight,
+      'Text-to-tool spacing stacks paragraph/turn margins, including across hidden tool owners.');
+    if (actions) verify(actions.getBoundingClientRect().top >= textBottom && toolTop >= actions.getBoundingClientRect().bottom + 8,
+      'Compact tool spacing overlaps the response copy control.');
+  }
+  const user: ChatMessage = { ...answer, id: 'spacing-user', role: 'user', text: 'Keep user controls separate.' };
+  const advisor: ChatMessage = { ...answer, id: 'spacing-advisor', role: 'custom', customType: 'advisor', text: '', details: { notes: [{ note: 'Check the project.' }] } };
+  const userGap = async (following: ChatMessage): Promise<number> => {
+    view.update({ ...source('user-spacing'), messages: [user, following] }, 'user-spacing'); await frame();
+    const bubble = view.content.querySelector<HTMLElement>('.user-message'), next = bubble?.nextElementSibling;
+    if (!bubble || !next) throw new Error('Missing user spacing fixture.');
+    return next.getBoundingClientRect().top - bubble.getBoundingClientRect().bottom;
+  };
+  verify(await userGap(answer) === await userGap(advisor), 'Agent spacing changes reduced user-message control clearance before Advisor.');
+  return 'Text-to-tool spacing stays compact for shared/separate tool owners and active/restored runs, without overlapping Copy or changing user-message clearance.';
+}
+
 function checkActivityPresentation(view: Conversation): string {
   const observedTools = ['read', 'bash', 'edit', 'ask', 'eval', 'glob', 'grep', 'task', 'wait', 'web_search', 'write', 'learn', 'manage_skill'];
   const glyphs = observedTools.map(name => toolIcon(name).innerHTML);
@@ -702,6 +736,7 @@ export async function checkLoadingBehavior(): Promise<string[]> {
     outcomes.push(await checkAdvisorDisclosure(view));
     outcomes.push(checkTodoActivity(view));
     outcomes.push(checkActivityPresentation(view));
+    outcomes.push(await checkTranscriptSpacing(view));
     outcomes.push(await checkShimmerSpeed(view, host));
     outcomes.push(await checkWorkFeedback(view));
     outcomes.push(checkResponseCopy(view));
