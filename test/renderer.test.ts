@@ -50,6 +50,22 @@ test('runtime bridge requires nullable, finite current context usage with a posi
     assert.equal(isRuntimeSnapshot({ ...runtime(), contextUsage }), false);
   }
 });
+test('runtime bridge validates attachment counts for both queued message kinds', () => {
+  for (const queue of ['queuedFollowUps', 'queuedSteers']) {
+    const entries = [{ text: 'Text only', imageCount: 0, imageRef: null }, { text: 'With images', imageCount: 2, imageRef: 'pictures' }, { text: '', imageCount: 1, imageRef: 'image-only' }];
+    assert.equal(isRuntimeSnapshot({ ...runtime(), [queue]: entries }), true);
+    for (const malformed of [
+      undefined, null, {}, 'legacy queue',
+      [null], ['legacy entry'], [[]], [{}],
+      [{ text: 'Missing count' }], [{ imageCount: 1 }], [{ text: 1, imageCount: 1 }],
+      ...[undefined, null, '1', -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1].map(imageCount => [{ text: 'Invalid count', imageCount, imageRef: 'pictures' }]),
+      ...[undefined, null, 1, '', 'invalid\0reference'].map(imageRef => [{ text: 'Missing image resource', imageCount: 1, imageRef }]),
+      [{ text: 'Unexpected image resource', imageCount: 0, imageRef: 'pictures' }],
+    ]) {
+      assert.equal(isRuntimeSnapshot({ ...runtime(), [queue]: malformed }), false, `${queue}: ${JSON.stringify(malformed)}`);
+    }
+  }
+});
 test('runtime bridge accepts only bounded, ordered observed work periods with unique identities', () => {
   const completed = { id: 'round-one', startedAt: 1000, endedAt: 3000, messageID: 'native-user' };
   const active = { id: 'round-two', startedAt: 3000, endedAt: null, messageID: null };

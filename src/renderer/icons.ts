@@ -4,6 +4,8 @@ import sidebarMore from '@tabler/icons/outline/dots.svg';
 import sidebarCompose from '@tabler/icons/outline/edit.svg';
 import folder from '@tabler/icons/outline/folder.svg';
 import folderOpen from '@tabler/icons/outline/folder-open.svg';
+import projectFolder from './assets/project-folder.svg';
+import projectFolderOpen from './assets/project-folder-open.svg';
 import pencil from '@tabler/icons/outline/pencil.svg';
 import plus from '@tabler/icons/outline/plus.svg';
 import settings from '@tabler/icons/outline/settings.svg';
@@ -14,7 +16,6 @@ import arrowRight from '@tabler/icons/outline/arrow-right.svg';
 import square from '@tabler/icons/outline/square.svg';
 import dots from '@tabler/icons/outline/dots.svg';
 import copy from '@tabler/icons/outline/copy.svg';
-import circle from '@tabler/icons/outline/circle.svg';
 import photo from '@tabler/icons/outline/photo.svg';
 import sliders from '@tabler/icons/outline/adjustments-horizontal.svg';
 import cpu from '@tabler/icons/outline/cpu.svg';
@@ -31,7 +32,7 @@ import bolt from '@tabler/icons/outline/bolt.svg';
 import sparkles from '@tabler/icons/outline/sparkles.svg';
 import circleCheck from '@tabler/icons/outline/circle-check.svg';
 import circleX from '@tabler/icons/outline/circle-x.svg';
-import loader from '@tabler/icons/outline/loader-2.svg';
+import loader from './assets/activity-spinner.svg';
 import x from '@tabler/icons/outline/x.svg';
 import tasks from '@tabler/icons/outline/list-check.svg';
 import agents from '@tabler/icons/outline/users.svg';
@@ -57,9 +58,9 @@ import tool from '@tabler/icons/outline/tool.svg';
 const icons = {
   sidebar, 'sidebar-hidden': sidebarHidden, 'sidebar-more': sidebarMore, 'sidebar-compose': sidebarCompose,
   folder, 'folder-open': folderOpen, plus, settings,
-  'project-folder': folder, 'project-folder-open': folderOpen,
+  'project-folder': projectFolder, 'project-folder-open': projectFolderOpen,
   'arrow-up': arrowUp, 'arrow-down': arrowDown, 'arrow-left': arrowLeft, 'arrow-right': arrowRight,
-  stop: square, more: dots, copy, circle, image: photo, close: x, sliders, model: cpu,
+  stop: square, more: dots, copy, image: photo, close: x, sliders, model: cpu,
   thinking: brain, context: gauge, 'chevron-right': chevronRight, check,
   inherit: arrowsSort, off: ban, low, medium, high, xhigh: bolt, max: sparkles,
   'circle-check': circleCheck, 'circle-x': circleX, 'loader-circle': loader,
@@ -83,6 +84,12 @@ export function icon(name: keyof typeof icons): SVGElement {
   return document.importNode(svg, true);
 }
 
+/** A separate caret; semantic icons remain visible beside their labels. */
+export function disclosureCaret(): SVGElement {
+  const caret = icon('chevron-right'); caret.classList.add('disclosure-caret');
+  return caret;
+}
+
 const toolIcons: Readonly<Record<string, keyof typeof icons | undefined>> = {
   read: 'file-search',
   write: 'file-plus',
@@ -102,13 +109,4 @@ const toolIcons: Readonly<Record<string, keyof typeof icons | undefined>> = {
 
 export function toolIcon(name: string): SVGElement {
   return icon(Object.hasOwn(toolIcons, name) ? toolIcons[name] ?? 'tool' : 'tool');
-}
-
-export function statusIcon(status: string): SVGElement {
-  switch (status) {
-    case 'completed': case 'succeeded': return icon('circle-check');
-    case 'failed': case 'error': case 'aborted': case 'interrupted': case 'cancelled': return icon('circle-x');
-    case 'active': case 'running': case 'started': return icon('loader-circle');
-    default: return icon('circle');
-  }
 }

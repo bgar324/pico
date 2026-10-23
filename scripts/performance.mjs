@@ -1,7 +1,7 @@
 import electron from 'electron';
 import { build } from 'esbuild';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, writeFile, copyFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, copyFile, cp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -10,13 +10,16 @@ const { values } = parseArgs({ options: { output: { type: 'string' }, runtime: {
 const root = await mkdtemp(join(tmpdir(), 'pi-performance-'));
 const resultPath = join(root, 'result.json');
 try {
+  await mkdir(join(root, 'katex'));
   await Promise.all([
     build({ entryPoints: ['scripts/performance-fixture.ts'], outfile: join(root, 'fixture.js'), bundle: true, platform: 'browser', target: 'chrome136', loader: { '.svg': 'text' } }),
     build({ entryPoints: ['src/renderer/index.ts'], outfile: join(root, 'app.js'), bundle: true, platform: 'browser', target: 'chrome136', minify: true, loader: { '.svg': 'text' } }),
     copyFile('src/renderer/style.css', join(root, 'style.css')),
+    copyFile('node_modules/katex/dist/katex.min.css', join(root, 'katex/katex.min.css')),
+    cp('node_modules/katex/dist/fonts', join(root, 'katex/fonts'), { recursive: true }),
     build({ entryPoints: ['scripts/performance-checks.ts'], outfile: join(root, 'checks.js'), bundle: true, platform: 'browser', target: 'chrome136', loader: { '.svg': 'text' } }),
   ]);
-  await writeFile(join(root, 'index.html'), '<!doctype html><html lang="en"><head><meta charset="UTF-8"><link rel="stylesheet" href="style.css"><script src="fixture.js" defer></script><script src="app.js" defer></script></head><body><div id="app"></div></body></html>');
+  await writeFile(join(root, 'index.html'), '<!doctype html><html lang="en"><head><meta charset="UTF-8"><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="katex/katex.min.css"><script src="fixture.js" defer></script><script src="app.js" defer></script></head><body><div id="app"></div></body></html>');
   const main = `
     import {app,BrowserWindow} from 'electron';
     import {mkdir,readFile,writeFile} from 'node:fs/promises';

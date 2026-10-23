@@ -22,7 +22,7 @@ export interface DesktopHost {
   darkMode(): boolean;
 }
 const IMAGE_MIME_BY_EXTENSION: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
-interface Opening { abort: AbortController; task: Promise<void> }
+interface Opening { abort: AbortController; task: Promise<void>; reason: 'open' | 'provider-connections' }
 export class AppController {
   manifest: Manifest = { projects: [], threads: [], selectedThreadID: null, sidebarVisible: true };
   preferences: Preferences = { executableOverride: '', appearance: 'system', defaultProjectPath: '', sidebarWidth: SIDEBAR_DEFAULT_WIDTH };
@@ -36,6 +36,9 @@ export class AppController {
   private readonly retiring = new Map<string, Promise<void>>();
   private readonly closing = new Set<string>();
   private readonly admitting = new Set<string>();
+  private readonly providerConnectionRefreshes = new Map<string, ThreadRuntime>();
+  private providerConnectionRevision = 0;
+  private providerConnectionRefreshTask: Promise<void> | null = null;
   private saveTimer: NodeJS.Timeout | undefined;
   private saveChain: Promise<void> = Promise.resolve();
   private revision = 0;
@@ -162,10 +165,74 @@ export class AppController {
   selectThread(id: string, reopen = false): Promise<void> {
     return this.openThread(id, reopen, this.executablePath);
   }
-  private async openThread(id: string, reopen: boolean, executable: string | null): Promise<void> {
+  async refreshProviderConnections(): Promise<void> {
+    if (this.stopping) return;
+    this.providerConnectionRevision++;
+    for (const [id, runtime] of this.runtimes) {
+      if (!this.closing.has(id) && !this.retiring.has(id)) this.providerConnectionRefreshes.set(id, runtime);
+    }
+    if (this.providerConnectionRefreshTask) return this.providerConnectionRefreshTask;
+    const task = Promise.resolve().then(async () => {
+      let revision: number;
+      do {
+        revision = this.providerConnectionRevision;
+        const connectionEpoch = ++this.connectionEpoch;
+        try {
+          // Account setup must recover even when the original no-model probe failed.
+          const executable = await this.connectionExecutable(connectionEpoch);
+          if (!executable || this.stopping || connectionEpoch !== this.connectionEpoch) continue;
+          const selected = this.manifest.selectedThreadID;
+          if (selected && !this.runtimes.has(selected) && !this.closing.has(selected) && !this.retiring.has(selected)) {
+            await this.openThread(selected, false, executable, 'provider-connections');
+          }
+          // Active conversations retain their pending entry until an idle notification.
+          await Promise.all([...this.providerConnectionRefreshes].map(([id, runtime]) => this.refreshRuntimeProviderConnections(id, runtime)));
+          if (this.stopping || connectionEpoch !== this.connectionEpoch) continue;
+          if (!this.runtimes.size && !this.closing.size && !this.retiring.size) await this.probeConnection(executable, connectionEpoch);
+          else this.updateRuntimeConnectionStatus();
+        } catch (error) {
+          if (!this.stopping && connectionEpoch === this.connectionEpoch) {
+            this.connectionStatus = `OMP connection failed: ${error instanceof Error ? error.message : String(error)}`;
+            this.notify();
+          }
+        }
+      } while (!this.stopping && revision !== this.providerConnectionRevision);
+    }).finally(() => {
+      if (this.providerConnectionRefreshTask === task) this.providerConnectionRefreshTask = null;
+    });
+    this.providerConnectionRefreshTask = task;
+    await task;
+  }
+  private updateRuntimeConnectionStatus(): void {
+    const runtime = this.runtimes.get(this.manifest.selectedThreadID ?? '') ??
+      [...this.runtimes.values()].find(candidate => candidate.summary().status.kind === 'ready');
+    if (!runtime) return;
+    const state = runtime.summary();
+    const status = state.status.kind === 'ready' ? 'Connected to OMP' : state.status.kind === 'connecting' ? 'Connecting to OMP…' :
+      state.error ? `OMP connection failed: ${state.error}` : this.connectionStatus;
+    if (status !== this.connectionStatus) { this.connectionStatus = status; this.notify(); }
+  }
+  private refreshRuntimeProviderConnections(id: string, runtime: ThreadRuntime): Promise<void> {
+    // Run after the current lifecycle frame, never from inside settle()/dialog reduction.
+    return Promise.resolve().then(async () => {
+      if (this.stopping || this.providerConnectionRefreshes.get(id) !== runtime || this.runtimes.get(id) !== runtime ||
+        this.closing.has(id) || this.retiring.has(id) || this.admitting.has(id)) return;
+      const opening = this.opening.get(id);
+      if (opening) { await opening.task; return; }
+      if (!runtime.canRefreshProviderConnections || !this.executablePath) return;
+      const connectionEpoch = this.connectionEpoch;
+      await this.openThread(id, true, this.executablePath, 'provider-connections');
+      if (!this.stopping && connectionEpoch === this.connectionEpoch) this.updateRuntimeConnectionStatus();
+    }).catch(error => {
+      if (this.stopping || this.closing.has(id) || this.runtimes.get(id) !== runtime) return;
+      this.error = `Could not refresh this conversation's provider models. Reopen it to try again. ${error instanceof Error ? error.message : String(error)}`;
+      this.notify();
+    });
+  }
+  private async openThread(id: string, reopen: boolean, executable: string | null, reason: 'open' | 'provider-connections' = 'open'): Promise<void> {
     this.requireThread(id);
     if (this.stopping || this.closing.has(id) || this.retiring.has(id)) throw new Error('This conversation is being closed.');
-    this.manifest.selectedThreadID = id; this.saveSoon(); this.notify();
+    if (reason === 'open') { this.manifest.selectedThreadID = id; this.saveSoon(); this.notify(); }
     const pending = this.opening.get(id);
     if (pending) { await pending.task; return; }
     const existing = this.runtimes.get(id);
@@ -182,6 +249,7 @@ export class AppController {
       });
       if (!idle) throw new Error('Three conversations are active. Stop one before opening another. No active work was interrupted.');
       const [idleID, runtime] = idle;
+      this.providerConnectionRefreshes.delete(idleID);
       retirement = runtime.shutdown();
       this.retiring.set(idleID, retirement);
       this.runtimeRevisions.set(idleID, Math.max(this.runtimeRevisions.get(idleID) ?? 0, runtime.summary().revision));
@@ -194,7 +262,11 @@ export class AppController {
       const revision = event.kind === 'snapshot' || event.kind === 'summary' ? event.runtime.revision : event.revision;
       this.runtimeRevisions.set(id, Math.max(this.runtimeRevisions.get(id) ?? 0, revision));
       this.emit({ kind: 'runtime', event });
+      if ((event.kind === 'snapshot' || event.kind === 'summary') && this.providerConnectionRefreshes.get(id) === runtime) void this.refreshRuntimeProviderConnections(id, runtime);
     }, (this.runtimeRevisions.get(id) ?? 0) + 1);
+    if (!existing) runtime.client.on('idle', () => {
+      if (this.runtimes.get(id) === runtime && this.providerConnectionRefreshes.get(id) === runtime) void this.refreshRuntimeProviderConnections(id, runtime);
+    });
     this.runtimes.set(id, runtime);
     this.runtimeRevisions.set(id, Math.max(this.runtimeRevisions.get(id) ?? 0, runtime.summary().revision));
     runtime.onActivity = () => {
@@ -205,9 +277,10 @@ export class AppController {
       if (state.selectedModelID) current.lastModel = state.selectedModelID;
       current.updatedAt = new Date().toISOString();
       this.saveSoon(); this.notify();
+      if (this.providerConnectionRefreshes.get(id) === runtime) void this.refreshRuntimeProviderConnections(id, runtime);
     };
     runtime.onEditorText = text => {
-      if (this.runtimes.get(id) !== runtime) return;
+      if (this.runtimes.get(id) !== runtime || this.opening.get(id)?.reason === 'provider-connections') return;
       this.setDraft(id, text); this.notify();
     };
     runtime.onSessionName = name => {
@@ -229,9 +302,15 @@ export class AppController {
       if (reopen) await runtime.shutdown();
       if (abort.signal.aborted || this.stopping || this.closing.has(id)) return;
       Object.assign(runtime.record, this.requireThread(id));
-      await runtime.connect(executable);
-    }).finally(() => { if (this.opening.get(id)?.abort === abort) this.opening.delete(id); });
-    this.opening.set(id, { abort, task });
+      // Changes received while shutting down are covered by this fresh process.
+      if (this.providerConnectionRefreshes.get(id) === runtime) this.providerConnectionRefreshes.delete(id);
+      await runtime.connect(executable, reason);
+    }).finally(() => {
+      if (this.opening.get(id)?.abort !== abort) return;
+      this.opening.delete(id);
+      if (this.providerConnectionRefreshes.get(id) === runtime) void this.refreshRuntimeProviderConnections(id, runtime);
+    });
+    this.opening.set(id, { abort, task, reason });
     this.emit({ kind: 'runtime', event: { kind: 'snapshot', runtime: { ...runtime.snapshot(), status: { kind: 'connecting' } } } });
     await task;
   }
@@ -259,7 +338,31 @@ export class AppController {
         thread.updatedAt = new Date().toISOString(); this.saveSoon(); this.notify();
       }
       return accepted;
-    } finally { this.admitting.delete(id); }
+    } finally {
+      this.admitting.delete(id);
+      if (this.providerConnectionRefreshes.get(id) === runtime) void this.refreshRuntimeProviderConnections(id, runtime);
+    }
+  }
+  async editMessage(id: string, messageID: string, message: string): Promise<boolean> {
+    this.requireWritable();
+    if (this.closing.has(id) || this.opening.has(id) || this.admitting.has(id)) throw new Error('Wait for the current message operation to finish.');
+    const thread = this.requireThread(id), runtime = this.runtimes.get(id);
+    if (!runtime || runtime.summary().status.kind !== 'ready') throw new Error('Open the conversation before editing a message.');
+    this.admitting.add(id);
+    try {
+      const accepted = await runtime.editMessage(messageID, message);
+      if (accepted && this.manifest.threads.includes(thread) && !this.closing.has(id)) {
+        // Editing a sent turn must not consume the unrelated composer draft.
+        thread.updatedAt = new Date().toISOString(); this.saveSoon(); this.notify();
+      }
+      return accepted;
+    } finally {
+      if (this.manifest.threads.includes(thread) && this.runtimes.get(id) === runtime && runtime.record.ompSessionFile) {
+        thread.ompSessionFile = runtime.record.ompSessionFile; this.saveSoon();
+      }
+      this.admitting.delete(id);
+      if (this.providerConnectionRefreshes.get(id) === runtime) void this.refreshRuntimeProviderConnections(id, runtime);
+    }
   }
   async runtimeFor(id: string): Promise<ThreadRuntime> {
     this.requireThread(id);
@@ -291,6 +394,7 @@ export class AppController {
     } finally { this.closing.delete(id); }
   }
   private async closeRuntime(id: string): Promise<void> {
+    this.providerConnectionRefreshes.delete(id);
     const opening = this.opening.get(id);
     opening?.abort.abort();
     const runtime = this.runtimes.get(id);
@@ -333,7 +437,9 @@ export class AppController {
     project.expanded = expanded; this.saveSoon(); this.notify();
   }
   async updatePreferences(preferences: Preferences): Promise<void> {
-    this.requireWritable(); this.preferences = { ...preferences }; await this.persistence.savePreferences(this.preferences); this.notify();
+    this.requireWritable();
+    await this.persistence.savePreferences(preferences);
+    this.preferences = { ...preferences }; this.notify();
   }
   async chooseExecutable(): Promise<void> {
     const path = await this.host.chooseExecutable();
@@ -373,7 +479,8 @@ export class AppController {
     try {
       await this.closeRuntime(id);
       const quote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
-      await this.host.terminal(`cd ${quote(thread.projectPath)} && ${quote(this.executablePath ?? 'omp')} --session-dir ${quote(thread.ompSessionDirectory)} --continue`);
+      const resume = thread.ompSessionFile ? `--resume ${quote(thread.ompSessionFile)}` : '--continue';
+      await this.host.terminal(`cd ${quote(thread.projectPath)} && ${quote(this.executablePath ?? 'omp')} --session-dir ${quote(thread.ompSessionDirectory)} ${resume}`);
       this.notify();
     } finally { this.closing.delete(id); }
   }
@@ -394,6 +501,7 @@ export class AppController {
   async shutdown(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.providerConnectionRefreshes.clear();
     clearTimeout(this.saveTimer);
     for (const opening of this.opening.values()) opening.abort.abort();
     await Promise.all([
@@ -402,6 +510,7 @@ export class AppController {
     ]);
     await Promise.all([...this.opening.values()].map(opening => opening.task));
     await Promise.all(this.connectionTests.values());
+    if (this.providerConnectionRefreshTask) await this.providerConnectionRefreshTask;
     await Promise.all(this.retiring.values());
     await this.saveChain;
     if (this.loaded && this.writable) {

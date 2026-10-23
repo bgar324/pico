@@ -1,6 +1,6 @@
 import type { ChatMessage, JsonRecord } from '../shared/types';
 import { element } from './dom';
-import { icon } from './icons';
+import { disclosureCaret, icon } from './icons';
 import { renderMarkdown } from './markdown';
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -159,8 +159,7 @@ function appendConsole(target: HTMLElement, text: string): void {
   target.append(output);
 }
 
-function renderAdvisor(target: HTMLElement, message: ChatMessage): void {
-  const content = element('div', 'advisor-notes');
+function appendAdvisorNotes(content: HTMLElement, message: ChatMessage): void {
   const notes = message.details?.notes;
   const envelopes = noticeEnvelopes(message.text, 'advisory');
   if (Array.isArray(notes) && notes.length && notes.every(note => record(note) && typeof note.note === 'string')) {
@@ -182,13 +181,37 @@ function renderAdvisor(target: HTMLElement, message: ChatMessage): void {
   } else {
     advisorNote(content, message.text, null, undefined);
   }
+}
+
+function renderAdvisor(target: HTMLElement, messages: readonly ChatMessage[]): void {
+  const content = element('div', 'advisor-notes');
+  for (const message of messages) appendAdvisorNotes(content, message);
   const group = target.querySelector<HTMLDetailsElement>(':scope > .advisor-group') ?? element('details', 'advisor-group');
   const summary = group.querySelector<HTMLElement>(':scope > summary') ?? element('summary', 'advisor-summary');
   const count = content.childElementCount;
-  const label = `Advisor · ${count} ${count === 1 ? 'note' : 'notes'}`;
-  if (summary.textContent !== label) {
-    const chevron = icon('chevron-right'); chevron.classList.add('disclosure-chevron');
-    summary.replaceChildren(chevron, element('span', '', label));
+  const label = count === 1 ? 'Advisor' : `Advisor · ${count} notes`;
+  let severity: 'neutral' | 'nit' | 'concern' | 'blocker' = 'neutral';
+  for (const note of content.children) {
+    if (note.classList.contains('notice-blocker')) { severity = 'blocker'; break; }
+    if (note.classList.contains('notice-concern')) severity = 'concern';
+    else if (severity === 'neutral' && note.classList.contains('notice-nit')) severity = 'nit';
+  }
+  if (summary.dataset.label !== label || summary.dataset.severity !== severity) {
+    if (summary.dataset.severity !== severity) {
+      const glyph = icon(severity === 'blocker' ? 'circle-x' : severity === 'concern' ? 'warning' : 'info');
+      glyph.classList.add('advisor-severity');
+      const previous = summary.querySelector(':scope > .advisor-severity');
+      if (previous) previous.replaceWith(glyph); else summary.prepend(glyph);
+      group.dataset.severity = severity; summary.dataset.severity = severity;
+    }
+    const text = summary.querySelector<HTMLElement>(':scope > .advisor-label') ?? element('span', 'advisor-label');
+    if (text.textContent !== label) text.textContent = label;
+    if (text.parentElement !== summary) summary.append(text);
+    if (!summary.querySelector(':scope > .disclosure-caret')) summary.append(disclosureCaret());
+    summary.dataset.label = label;
+    const severityLabel = severity === 'neutral' ? 'Note' : fieldLabel(severity);
+    summary.setAttribute('aria-label', `${label} · ${severityLabel}`);
+    summary.title = severityLabel;
   }
   if (summary.parentElement !== group) group.prepend(summary);
   const previous = group.querySelector(':scope > .advisor-notes');
@@ -241,14 +264,14 @@ export function isRuleNotice(message: ChatMessage): boolean {
 }
 
 /** Return false for ordinary messages so the normal streaming renderer owns them. */
-export function renderBackgroundMessage(target: HTMLElement, message: ChatMessage): boolean {
+export function renderBackgroundMessage(target: HTMLElement, message: ChatMessage, advisorMessages?: readonly ChatMessage[]): boolean {
   if (message.role === 'user' || message.isStreaming) return false;
   const execution = message.role === 'bashExecution' || message.role === 'pythonExecution';
   const advisor = message.role === 'custom' && message.customType === 'advisor';
   const rule = isRuleNotice(message);
   const asyncResult = message.role === 'custom' && message.customType === 'async-result';
   if (!execution && !advisor && !rule && !asyncResult) return false;
-  if (advisor) { renderAdvisor(target, message); return true; }
+  if (advisor) { renderAdvisor(target, advisorMessages ?? [message]); return true; }
   const text = message.text.replace(/^<system-notice>\r?\n?/, '').replace(/\r?\n?<\/system-notice>\s*$/, '');
   const single = /^Background job ([^\s]+) has completed\. Resume your work using the result below\.(?:\r?\n)?/.exec(text);
   const multiple = /^\d+ background jobs have completed\. Resume your work using the results below\.(?:\r?\n)?/.exec(text);

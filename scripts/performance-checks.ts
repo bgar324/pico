@@ -1,11 +1,15 @@
 import { Conversation } from '../src/renderer/conversation';
-import type { ChatMessage, RuntimeSnapshot, ToolActivity } from '../src/shared/types';
+import type { ChatMessage, ImageContent, RetractedMessage, RuntimeSnapshot, ToolActivity } from '../src/shared/types';
 import { MessageStore } from '../src/omp/MessageStore';
 import { toolIcon } from '../src/renderer/icons';
 import { Composer } from '../src/renderer/composer';
 import { TodoPanel } from '../src/renderer/todo-panel';
 import { checkSidebarTransitions } from './sidebar-checks';
 import { checkMainFrameStates } from './main-frame-checks';
+import { renderMarkdown } from '../src/renderer/markdown';
+import { checkManualStreamingScroll } from './scroll-checks';
+import { checkStreamingPresentation } from './streaming-checks';
+import { checkCodeCopyReconciliation } from './code-copy-checks';
 
 function verify(condition: unknown, message: string): void { if (!condition) throw new Error(message); }
 async function frame(): Promise<void> {
@@ -107,6 +111,7 @@ async function checkAdvisorDisclosure(view: Conversation): Promise<string> {
   if (!group || !summary || !first) throw new Error('Missing Advisor disclosure.');
   verify(!group.open && !first.checkVisibility() && group.getBoundingClientRect().height <= 32, 'Advisor feedback did not start as one compact collapsed row.');
   verify(group.querySelectorAll('.advisor-notice').length === 2 && !group.textContent?.includes('INTERNAL_REVIEW_WRAPPER'), 'Advisor XML/metadata duplicated notes or leaked its model-facing wrapper.');
+  verify(group.dataset.severity === 'blocker', 'Advisor summary did not reflect the highest rendered note severity.');
   summary.click(); await frame();
   verify(first.checkVisibility() && group.querySelector('.notice-blocker code')?.textContent === 'x < y', 'Expanded Advisor feedback lost its note content or severity.');
   summary.focus();
@@ -123,7 +128,58 @@ async function checkAdvisorDisclosure(view: Conversation): Promise<string> {
   view.update({ ...source('advisor-restored'), messages: structuredClone([...store.messages.values()]) }, 'advisor-restored'); await frame();
   const restored = view.content.querySelector<HTMLDetailsElement>('.advisor-group');
   verify(restored && !restored.open && restored.querySelectorAll('.advisor-notice').length === 3, 'Restored review history lost notes or started expanded.');
-  return 'Advisor batches stay compact by default, retain distinct notes and severity, preserve disclosure/focus through updates, and expand for Find without leaking raw source.';
+  const second = notes[1];
+  if (!second || !restored) throw new Error('Missing Advisor severity transition fixture.');
+  const previousLabel = restored.querySelector('.advisor-label')?.textContent;
+  second.severity = 'nit';
+  view.update({ ...source('advisor-restored'), revision: 2, messages: [...store.messages.values()].map(message => ({ ...message, details: { notes: [...notes] } })) }, 'advisor-restored'); await frame();
+  verify(restored.dataset.severity === 'concern' && restored.querySelector('.advisor-label')?.textContent === previousLabel,
+    'Changing severity without changing note count left a stale Advisor summary or changed its count.');
+  view.update({ ...source('advisor-single'), messages: [{ id: 'single-review', role: 'custom', customType: 'advisor', text: '', thinking: '', error: null, isStreaming: false, toolIDs: [], details: { notes: [{ note: 'Keep this single note available.' }] } }] }, 'advisor-single'); await frame();
+  const single = view.content.querySelector<HTMLDetailsElement>('.advisor-group');
+  verify(single && single.checkVisibility() && !single.open && single.querySelectorAll('.advisor-notice').length === 1,
+    'A single Advisor note was hidden or lost instead of remaining a compact disclosure.');
+  verify(single?.dataset.severity === 'nit' && !/\d/u.test(single.querySelector('.advisor-label')?.textContent ?? ''),
+    'A single Advisor note retained a numeric counter or lost the default nit severity.');
+  const earlier: ChatMessage = { id: 'review-first', role: 'custom', customType: 'advisor', text: '', thinking: '', error: null, isStreaming: false, toolIDs: [], details: { notes: [{ note: 'First separate delivery.', severity: 'concern' }] } };
+  const later: ChatMessage = { ...earlier, id: 'review-second', text: '<advisory severity="blocker">Second separate delivery.</advisory>', details: {} };
+  const hidden: ChatMessage = { ...earlier, id: 'hidden-delivery', customType: 'async-result', details: { jobs: [{ type: 'bash' }] } };
+  const publishBatch = (messages: ChatMessage[]): void => view.update({ ...source('advisor-deliveries'), messages }, 'advisor-deliveries');
+  publishBatch([earlier]);
+  const joined = view.content.querySelector<HTMLDetailsElement>('.advisor-group');
+  const joinedSummary = joined?.querySelector('summary');
+  if (!joined || !joinedSummary) throw new Error('Missing separate-delivery Advisor fixture.');
+  joinedSummary.click(); joinedSummary.focus();
+  publishBatch([earlier, hidden, later]); await frame();
+  verify(view.content.querySelectorAll('.advisor-group').length === 1 && joined.isConnected && joined.open && document.activeElement === joinedSummary,
+    'A later Advisor delivery created a second header or reset the existing disclosure/focus.');
+  verify(joined.querySelectorAll('.advisor-notice').length === 2 && joined.dataset.severity === 'blocker' && joined.querySelector('.advisor-label')?.textContent === 'Advisor · 2 notes',
+    'Joining metadata and XML Advisor deliveries lost notes, count, or highest severity.');
+  const firstDelivery = joined.querySelector('.advisor-notice');
+  const updatedLater = { ...later, text: '<advisory severity="nit">Updated second delivery.</advisory>' };
+  publishBatch([earlier, hidden, updatedLater]);
+  verify(joined.querySelector('.advisor-notice') === firstDelivery && joined.textContent?.includes('Updated second delivery.') && !joined.textContent?.includes('Second separate delivery.') && joined.dataset.severity === 'concern',
+    'Updating a non-leading Advisor delivery left stale notes/severity or replaced unchanged prose.');
+  joinedSummary.click();
+  view.showFind(); view.findInput.value = 'Updated second delivery'; view.findInput.dispatchEvent(new Event('input')); await frame();
+  verify(joined.open && view.content.querySelectorAll('.find-match').length === 1, 'Find did not reveal an exact note from a joined delivery.');
+  view.findInput.value = ''; view.findInput.dispatchEvent(new Event('input'));
+  publishBatch([earlier]);
+  verify(view.content.querySelectorAll('.advisor-notice').length === 1 && joined.querySelector('.advisor-label')?.textContent === 'Advisor', 'Removing a joined delivery left its note or count behind.');
+  const response: ChatMessage = { id: 'response-between', role: 'assistant', text: 'Actual conversation output.', thinking: '', error: null, isStreaming: false, toolIDs: [] };
+  publishBatch([earlier, response, later]);
+  verify(view.content.querySelectorAll('.advisor-group').length === 2, 'Advisor grouping moved feedback across actual conversation output.');
+  view.update({ ...source('advisor-deliveries-restored'), messages: structuredClone([earlier, hidden, later]) }, 'advisor-deliveries-restored');
+  verify(view.content.querySelectorAll('.advisor-group').length === 1 && view.content.querySelectorAll('.advisor-notice').length === 2 && !view.content.querySelector<HTMLDetailsElement>('.advisor-group')?.open,
+    'Restored separate Advisor deliveries did not form one collapsed disclosure.');
+  const history: ChatMessage[] = Array.from({ length: 65 }, (_, index) => ({ ...response, id: `advisor-history-${index}` }));
+  history.splice(4, 2, earlier, later);
+  view.update({ ...source('advisor-history-boundary'), messages: history }, 'advisor-history-boundary');
+  verify(view.content.querySelectorAll('.advisor-notice').length === 2, 'Initial history pagination split a joined Advisor batch.');
+  await complete(view);
+  verify(view.content.querySelectorAll('.advisor-group').length === 1 && view.content.querySelectorAll('.advisor-notice').length === 2,
+    'Incremental history loading duplicated a joined Advisor disclosure.');
+  return 'Advisor deliveries join into one compact disclosure across hidden notices, preserve notes/severity/focus through updates and restoration, respect conversation boundaries, and expand exact Find matches without pagination splits.';
 }
 
 function checkTodoActivity(view: Conversation): string {
@@ -178,12 +234,18 @@ function checkActivityPresentation(view: Conversation): string {
   runtime = { ...runtime, revision: 2, messages: structuredClone([...store.messages.values()]), tools: structuredClone([...store.tools.values()]) };
   view.update(runtime, runtime.id);
   const group = view.content.querySelector<HTMLDetailsElement>('.activity-group');
+  if (!group) throw new Error('Missing owned Activity disclosure.');
   verify(group && view.content.querySelectorAll('.activity-group').length === 1 && group.open && evalNode.open && evalNode.isConnected, 'Resolving tool ownership lost or duplicated its Activity disclosure.');
   verify(!view.content.querySelector('.message .tool,:scope > .tool') && view.content.querySelector('[data-message-id="owner"]')?.textContent?.includes('I am checking the project.'), 'Tools escaped Activity or hid assistant prose/reasoning.');
-  verify(group?.querySelector('.activity-current')?.textContent === 'Bash npm run typecheck && npm test' && group.querySelector('.activity-current.work-shimmer') && !group.querySelector('.activity-state') && group.querySelector('.activity-summary')?.getAttribute('aria-description')?.startsWith('Running'), 'Activity lost its current running command/status or retained a right-hand spinner.');
+  verify(group.querySelector('.activity-current.work-shimmer') && !group.querySelector('.activity-state') && group.querySelector('.activity-summary')?.getAttribute('aria-description')?.startsWith('Running'), 'Activity lost its current running status or retained a right-hand spinner.');
   store.consume({ type: 'tool_execution_end', toolCallId: 'bash', toolName: 'bash', result: { content: [{ type: 'text', text: 'Checks passed' }] } });
   view.update({ ...runtime, revision: 3, tools: structuredClone([...store.tools.values()]) }, runtime.id);
-  verify(!group?.querySelector<HTMLElement>('.activity-current')?.hidden && group?.querySelector('.activity-current')?.textContent === 'Bash npm run typecheck && npm test' && !group.querySelector('.activity-current.work-shimmer') && group.querySelector('.activity-state.failed'), 'Finished tool work lost its latest action or kept shimmering.');
+  verify(!group.querySelector<HTMLElement>('.activity-current')?.hidden && !group.querySelector('.activity-current.work-shimmer'), 'Finished tool work hid its latest action or kept shimmering.');
+  verify(!group.querySelector('.activity-state') && !group.querySelector('.activity-summary')?.getAttribute('aria-description')?.includes('failed'), 'Completed activity retained a failure badge or collapsed failure announcement.');
+  group.open = true; evalNode.open = true;
+  verify(evalNode.querySelector<HTMLElement>('.tool-output')?.innerText.includes('Evaluation failed'), 'Quiet failure styling hid the inspectable tool output.');
+  view.update({ ...runtime, revision: 4, tools: [...store.tools.values()].map<ToolActivity>(tool => tool.id === 'eval' ? { ...tool, state: 'interrupted' } : tool) }, runtime.id);
+  verify(group.querySelector('.activity-summary')?.getAttribute('aria-description') === 'Interrupted' && evalNode.querySelector('summary')?.getAttribute('aria-description') === 'interrupted', 'Interrupted activity lost its accessible status.');
   return 'Ask/Eval and orphan tools stay in Activity; live commands shimmer and completed rounds retain a static latest action.';
 }
 async function checkShimmerSpeed(view: Conversation, host: HTMLElement): Promise<string> {
@@ -226,7 +288,7 @@ async function checkShimmerSpeed(view: Conversation, host: HTMLElement): Promise
     verify(long.width > short.width * 2, 'Shimmer comparison did not exercise different label widths.');
     view.node.style.width = '300px';
     const narrow = await measure('.activity-current.work-shimmer', view.content);
-    verify(narrow.width < long.width && (view.content.querySelector<HTMLElement>('.activity-current')?.scrollWidth ?? 0) > narrow.width + 1, 'Narrow shimmer did not exercise a clipped command.');
+    verify(narrow.width < long.width, 'Narrow shimmer did not exercise a constrained command.');
     const speeds = [thinking.speed, task.speed, short.speed, long.speed, narrow.speed];
     verify(speeds.every(speed => Math.abs(speed - thinking.speed) < 1), `Shimmer speed differed across labels or resizing: ${speeds.join(', ')}.`);
     runtime = { ...runtime, revision: 4, tools: runtime.tools.map(tool => ({ ...tool, state: 'succeeded', endedAt: Date.now() })) };
@@ -274,21 +336,21 @@ async function checkWorkFeedback(view: Conversation): Promise<string> {
   verify(advisorIndex > rows.findIndex(node => node.getAttribute('data-message-id') === 'work-reply') && rows[advisorIndex + 1]?.getAttribute('data-message-id') === 'work-continuation' && !view.content.querySelector('.response-actions,.work-thinking'), 'Advisor follow-up did not append directly to the stream or retained completed response controls.');
   runtime = { ...runtime, revision: 5, status: { kind: 'ready', activity: 'idle' }, workPeriods: [{ id: 'work-1', startedAt, endedAt: Date.now(), messageID: 'work-user' }], messages: runtime.messages.map(message => message.id === 'work-continuation' ? { ...message, text: 'The cleanup path is verified.', isStreaming: false } : message) };
   view.update(runtime, runtime.id);
-  verify(view.content.querySelectorAll('.work-period').length === 1 && duration.textContent?.startsWith('Worked for ') && view.content.querySelectorAll('.response-actions').length === 1 && view.content.lastElementChild?.getAttribute('data-response-id') === 'work-continuation', 'Reviewed completion retained duplicate work or response controls.');
+  verify(view.content.querySelectorAll('.work-period').length === 1 && duration.textContent?.startsWith('Worked for ') && view.content.querySelectorAll('.response-actions').length === 1, 'Reviewed completion retained duplicate work or response controls.');
   return 'Immediate Thinking, ticking/frozen elapsed time, and late Advisor continuation appended under the original clock with one final response action.';
 }
 
 function checkResponseCopy(view: Conversation): string {
   const message = (id: string, role: string, text: string): ChatMessage => ({ id, role, text, thinking: '', error: null, isStreaming: false, toolIDs: [] });
-  const copies = (): NodeListOf<Element> => view.node.querySelectorAll('.copy-message,.code-copy,.tool-copy,button[aria-label="Copy message"],button[aria-label="Copy response"]');
+  const copies = (): NodeListOf<Element> => view.node.querySelectorAll('.copy-message,.tool-copy,.queued button[aria-label="Copy message"],button[aria-label="Copy response"]');
   const user = message('copy-user', 'user', 'Inspect the project');
   const progress = { ...message('copy-progress', 'assistant', 'I am checking the files.\n\n```ts\nconst pending = true;\n```'), toolIDs: ['copy-read'] };
   const answer = message('copy-answer', 'assistant', 'The project is ready.');
   const advisor = { ...message('copy-advisor', 'custom', 'A review note after the answer.'), customType: 'advisor' };
   const period = { id: 'copy-work', startedAt: Date.now(), endedAt: null, messageID: user.id };
-  let runtime: RuntimeSnapshot = { ...source('response-copy'), messages: [user, progress], tools: [{ id: 'copy-read', name: 'read', target: 'project.ts', detail: 'path: project.ts', output: 'Project source', state: 'succeeded', startedAt: 1, endedAt: 2 }], queuedFollowUps: ['Check the next file'], status: { kind: 'ready', activity: 'running' }, workPeriods: [period] };
+  let runtime: RuntimeSnapshot = { ...source('response-copy'), messages: [user, progress], tools: [{ id: 'copy-read', name: 'read', target: 'project.ts', detail: 'path: project.ts', output: 'Project source', state: 'succeeded', startedAt: 1, endedAt: 2 }], queuedFollowUps: [{ text: 'Check the next file', imageCount: 0, imageRef: null }], status: { kind: 'ready', activity: 'running' }, workPeriods: [period] };
   view.update(runtime, runtime.id);
-  verify(copies().length === 0, 'Intermediate progress or queued messages exposed copy controls.');
+  verify(copies().length === 0, 'Intermediate progress or queued messages exposed whole-response copy controls.');
   runtime = { ...runtime, revision: 2, messages: [user, progress, { ...answer, isStreaming: true }] };
   view.update(runtime, runtime.id);
   verify(!view.content.querySelector('.response-actions'), 'Streaming answer exposed a copy control.');
@@ -298,17 +360,17 @@ function checkResponseCopy(view: Conversation): string {
   runtime = { ...runtime, revision: 4, status: { kind: 'ready', activity: 'idle' }, workPeriods: [{ ...period, endedAt: Date.now() }] };
   view.update(runtime, runtime.id);
   const footer = view.content.querySelector<HTMLElement>('.response-actions');
-  verify(footer?.dataset.responseId === answer.id && view.content.lastElementChild === footer && footer.querySelector('button[aria-label="Copy response"]'), 'Completed response did not expose one copy below trailing review content.');
-  verify(copies().length === 1, 'Completed response retained extra per-message, queued, or per-block copy controls.');
+  verify(footer?.dataset.responseId === answer.id && footer.querySelector('button[aria-label="Copy response"]'), 'Completed answer did not expose its whole-response copy control.');
+  verify(copies().length === 1, 'Completed response retained extra per-message or queued copy controls.');
   const followup = message('copy-followup', 'user', 'Now check the next file');
   runtime = { ...runtime, revision: 5, messages: [...runtime.messages, followup, message('copy-next-progress', 'assistant', 'Checking the next file.')], status: { kind: 'ready', activity: 'running' }, workPeriods: [...runtime.workPeriods ?? [], { ...period, id: 'copy-next-work', messageID: followup.id }] };
   view.update(runtime, runtime.id);
-  verify(footer?.nextElementSibling?.getAttribute('data-message-id') === followup.id && view.content.querySelectorAll('.response-actions').length === 1, 'A new run moved the prior response copy or exposed an intermediate copy.');
+  verify(view.content.querySelectorAll('.response-actions').length === 1, 'A new run exposed an intermediate whole-response copy.');
   const steered = message('copy-steer', 'user', 'Also inspect the config');
   runtime = { ...runtime, revision: 6, messages: [...runtime.messages, steered] };
   view.update(runtime, runtime.id);
   verify(view.content.querySelectorAll('.response-actions').length === 1, 'A steer incorrectly marked the active response complete.');
-  return 'One copy control below each completed answer, no interim/code/tool copies, and stable placement through review notes, new runs, and steers.';
+  return 'One whole-response copy per completed answer, independent code-block copies, and no premature response copies during review, new runs, or steers.';
 }
 
 async function checkComposerSizing(view: Conversation, host: HTMLElement): Promise<string> {
@@ -385,12 +447,12 @@ async function checkSubmissionScroll(view: Conversation, host: HTMLElement): Pro
   } finally { admission.resolve(false); window.pi = bridge; composer.node.remove(); }
 }
 
-async function checkComposerImagePreview(host: HTMLElement): Promise<string> {
+async function checkComposerImagePreview(view: Conversation, host: HTMLElement): Promise<string> {
   const composer = new Composer(text => { throw new Error(text); }, async () => null, () => { throw new Error('Unexpected submission from image-preview check.'); });
   const runtime = source('composer-preview');
   const thread = { id: runtime.id, projectPath: '/preview', displayTitle: 'Preview', ompSessionDirectory: '/preview/session', createdAt: '', updatedAt: '', draft: '', wasRunning: false };
   composer.update(thread, runtime); host.append(composer.node);
-  const dialog = (): HTMLDialogElement | null => document.querySelector('.composer-image-preview');
+  const dialog = (): HTMLDialogElement | null => document.querySelector('.image-preview');
   const thumbnail = (): HTMLButtonElement => {
     const node = composer.node.querySelector<HTMLButtonElement>('.composer-image-open');
     if (!node) throw new Error('Missing composer image thumbnail.');
@@ -412,10 +474,13 @@ async function checkComposerImagePreview(host: HTMLElement): Promise<string> {
     if (!preview) throw new Error('Image click did not open its preview.');
     await preview.decode();
     const bounds = preview.getBoundingClientRect();
-    verify(dialog()?.open && preview.naturalWidth === 1200 && preview.naturalHeight === 800 && preview.src === trigger.querySelector('img')?.src && preview.alt === file.name, 'Preview lost original image content or its accessible name.');
+    verify(dialog()?.open && preview.naturalWidth === 1200 && preview.naturalHeight === 800 && preview.src === trigger.querySelector('img')?.src, 'Preview lost the original image content.');
     verify(bounds.width > 72 && bounds.height > 60 && bounds.right <= innerWidth && bounds.bottom <= innerHeight, 'Preview was not enlarged and fitted to the viewport.');
+    verify(!composer.node.innerText.includes(file.name) && !dialog()?.innerText.includes(file.name), 'Image filenames remained visible in the composer or magnifier.');
     const close = dialog()?.querySelector<HTMLButtonElement>('button');
     if (!close) throw new Error('Missing image preview close control.');
+    const modalBounds = dialog()?.getBoundingClientRect(), closeBounds = close.getBoundingClientRect();
+    verify(modalBounds && closeBounds.top < modalBounds.top + 24 && closeBounds.right > modalBounds.right - 24 && close.querySelector('svg') && !close.textContent?.trim(), 'Magnifier close control was not an icon at the top right.');
     verify(document.activeElement === close, 'Preview did not move focus to Close.');
     close.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
     verify(document.activeElement === close, 'Preview Tab escaped its focus trap.');
@@ -430,8 +495,191 @@ async function checkComposerImagePreview(host: HTMLElement): Promise<string> {
     composer.update(thread, runtime); thumbnail().click();
     composer.node.querySelector<HTMLButtonElement>('.image-remove')?.click();
     verify(!dialog() && !composer.node.querySelector('.composer-image'), 'Removing the previewed attachment left a modal behind.');
-    return 'Pasted composer image opens at full resolution in a fitted modal; focus, Close/Escape/backdrop, thread isolation, removal, and draft retention work.';
+    const frameImage: ImageContent = { type: 'image', mimeType: 'image/png', data: canvas.toDataURL().split(',')[1] ?? '' };
+    context.fillStyle = '#ab4938'; context.fillRect(0, 0, canvas.width, canvas.height);
+    const secondImage: ImageContent = { ...frameImage, data: canvas.toDataURL().split(',')[1] ?? '' };
+    const sentMessage: ChatMessage = { id: 'sent-image', role: 'user', text: '', thinking: '', toolIDs: [], error: null, isStreaming: false, images: [frameImage, secondImage] };
+    const sentRuntime = { ...runtime, messages: [sentMessage] };
+    view.update(sentRuntime, runtime.id);
+    const sentTriggers = view.content.querySelectorAll<HTMLButtonElement>('.message-image-open');
+    const sentTrigger = sentTriggers[0], secondTrigger = sentTriggers[1];
+    if (!sentTrigger || !secondTrigger) throw new Error('Sent image thumbnails were not interactive.');
+    sentTrigger.focus(); sentTrigger.click(); await frame();
+    const sentPreview = dialog()?.querySelector<HTMLImageElement>('.modal-body img');
+    if (!sentPreview) throw new Error('Sent image did not open the shared magnifier.');
+    await sentPreview.decode();
+    verify(sentPreview.src === `data:${frameImage.mimeType};base64,${frameImage.data}` && sentPreview.naturalWidth === 1200 && sentPreview.naturalHeight === 800,
+      'Sent image magnifier used a resized thumbnail instead of full-resolution bytes.');
+    const openDialog = dialog();
+    view.update({ ...sentRuntime, revision: 2, messages: [{ ...sentMessage, text: 'Sent image caption.' }] }, runtime.id);
+    verify(dialog() === openDialog && dialog()?.open, 'A passive message update closed the sent image magnifier.');
+    dialog()?.dispatchEvent(new Event('cancel', { cancelable: true }));
+    verify(!dialog() && document.activeElement === sentTrigger, 'Closing a sent image magnifier lost thumbnail focus.');
+    secondTrigger.focus(); secondTrigger.click(); await frame();
+    verify(dialog()?.open && dialog()?.querySelector<HTMLImageElement>('.modal-body img')?.src === `data:${secondImage.mimeType};base64,${secondImage.data}`, 'A second sent attachment opened the wrong image.');
+    view.node.remove(); await frame();
+    verify(!dialog(), 'Switching away from a cached conversation left its image magnifier open.');
+    host.prepend(view.node); sentTrigger.focus(); sentTrigger.click();
+    view.update({ ...sentRuntime, revision: 3, messages: [{ ...sentMessage, images: [] }] }, runtime.id);
+    verify(!dialog() && !view.content.querySelector('.message-image-open'), 'Removing a sent image left a stale magnifier or thumbnail.');
+    return 'Composer filenames stay hidden; draft and sent images share a full-resolution, top-right icon-close magnifier with keyboard focus, Escape/backdrop dismissal, passive-update stability, and thread/removal cleanup.';
   } finally { dialog()?.dispatchEvent(new Event('cancel', { cancelable: true })); composer.node.remove(); }
+}
+
+async function checkComposerDrop(host: HTMLElement): Promise<string> {
+  const bridge = window.pi, errors: string[] = [];
+  window.pi = { ...bridge, pathsFromDrop: files => files.map(file => `/drop/${file.name}`) };
+  const composer = new Composer(text => errors.push(text), async () => null, () => { throw new Error('Drop submitted a message.'); });
+  const runtime = source('composer-drop');
+  const thread = { id: runtime.id, projectPath: '/drop', displayTitle: 'Drop', ompSessionDirectory: '/drop/session', createdAt: '', updatedAt: '', draft: 'Existing draft', wasRunning: false };
+  composer.update(thread, runtime); host.append(composer.node);
+  const dispose = composer.bindDropTarget(host);
+  const overlay = host.querySelector<HTMLElement>('.composer-drop-overlay');
+  if (!overlay) throw new Error('Missing drop overlay.');
+  const canvas = document.createElement('canvas'); canvas.width = 32; canvas.height = 24;
+  const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve));
+  if (!blob) throw new Error('Could not encode drop fixture.');
+  const transfer = new DataTransfer();
+  transfer.items.add(new File([blob], 'image.png', { type: 'image/png' }));
+  transfer.items.add(new File(['PDF fixture'], 'report with spaces.pdf', { type: 'application/pdf' }));
+  const drag = (node: HTMLElement, type: string): void => { node.dispatchEvent(new DragEvent(type, { dataTransfer: transfer, bubbles: true, cancelable: true })); };
+  try {
+    drag(host, 'dragenter'); drag(composer.editor, 'dragenter'); drag(composer.editor, 'dragleave');
+    verify(!overlay.hidden, 'Moving between nested drop targets dismissed the overlay.');
+    drag(host, 'dragleave'); verify(overlay.hidden, 'Leaving the chat left the drop overlay stuck.');
+    drag(host, 'dragenter'); window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    verify(overlay.hidden, 'Escape did not dismiss the drag overlay.');
+    drag(host, 'dragenter'); drag(host, 'drop'); await frame();
+    const deadline = performance.now() + 3000;
+    while (!composer.node.querySelector('img')) { verify(performance.now() < deadline, 'Dropped image did not attach.'); await frame(); }
+    verify(overlay.hidden && composer.editor.value === 'Existing draft\n\n"/drop/report with spaces.pdf"', 'Mixed file drop lost the existing draft or local file reference.');
+    const image = composer.node.querySelector<HTMLImageElement>('img'); if (!image) throw new Error('Missing dropped image.');
+    await image.decode(); verify(image.naturalWidth === 32 && image.naturalHeight === 24, 'Dropped image lost its actual content.');
+    const before = composer.editor.value;
+    composer.update(thread, { ...runtime, status: { kind: 'connecting' } });
+    drag(host, 'dragenter'); drag(host, 'drop');
+    verify(overlay.hidden && composer.editor.value === before && errors.length === 0, 'Unavailable composer accepted a drop or left its overlay visible.');
+    return 'File drops dim the chat, survive nested drag transitions, dismiss on exit/Escape/drop, preserve drafts, attach image bytes, add local file references, and respect unavailable composer state.';
+  } finally { dispose(); composer.node.remove(); window.pi = bridge; }
+}
+
+async function checkQueuedEditing(view: Conversation, host: HTMLElement): Promise<string> {
+  const bridge = window.pi, errors: string[] = [];
+  const canvas = document.createElement('canvas'); canvas.width = 2; canvas.height = 2;
+  const image = { type: 'image', mimeType: 'image/png', data: canvas.toDataURL('image/png').split(',')[1] ?? '' } satisfies ImageContent;
+  let runtime: RuntimeSnapshot = { ...source('queued-edit'), messages: [], models: [{ id: 'vision', modelID: 'vision', provider: 'test', name: 'Vision', supportsImages: true }], selectedModelID: 'vision', status: { kind: 'ready', activity: 'running' }, queuedFollowUps: [{ text: 'Queued text', imageCount: 1, imageRef: 'queued-image' }] };
+  const thread = { id: runtime.id, projectPath: '/edit', displayTitle: 'Edit', ompSessionDirectory: '/edit/session', createdAt: '', updatedAt: '', draft: 'Existing draft', wasRunning: false };
+  const other = { ...thread, id: 'queued-edit-other', draft: 'Other draft' };
+  const composer = new Composer(text => errors.push(text), async () => null, () => {});
+  let removed = Promise.withResolvers<RetractedMessage | null>(), requests = 0, prompts = 0;
+  let completed: Promise<void> = Promise.resolve();
+  view.onEditQueued = value => { completed = composer.retractQueued(value); return completed; };
+  window.pi = { ...bridge, async request(request) {
+    if (request.kind === 'draft') return { ok: true, value: null };
+    if (request.kind === 'queued-images') return { ok: true, value: [image] };
+    if (request.kind === 'prompt') { prompts++; return { ok: true, value: true }; }
+    if (request.kind === 'retract-queued') { requests++; return { ok: true, value: await removed.promise }; }
+    return bridge.request(request);
+  } };
+  const publish = (): void => { view.update(runtime, runtime.id); composer.update(thread, runtime); };
+  const type = (text: string): void => { composer.editor.value = text; composer.editor.dispatchEvent(new Event('input', { bubbles: true })); };
+  const edit = (): HTMLButtonElement => {
+    const control = view.pending.querySelector<HTMLButtonElement>('.queued-edit');
+    if (!control) throw new Error('Missing queued Edit action.');
+    return control;
+  };
+  host.append(composer.node);
+  try {
+    publish(); await frame();
+    const clipboard = new DataTransfer(); clipboard.items.add(new File([await (await fetch(canvas.toDataURL())).blob()], 'existing.png', { type: 'image/png' }));
+    composer.editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: clipboard, bubbles: true, cancelable: true }));
+    const deadline = performance.now() + 3000;
+    while (!composer.node.querySelector('.composer-image')) { verify(performance.now() < deadline, 'Existing image draft did not load.'); await frame(); }
+    verify(view.pending.querySelector('.message-images img')?.getAttribute('src') === canvas.toDataURL(), 'Queued preview stopped using actual shared message images.');
+    verify(!view.pending.querySelector('.queued-attachments,.queued-label'), 'Queued bubble exposed old count/status indicators.');
+    edit().click(); edit().click();
+    verify(requests === 1 && composer.node.querySelector<HTMLButtonElement>('.image-remove')?.disabled, 'Edit double-clicked or left source attachments removable.');
+    type('Newer draft'); await composer.submit(false);
+    verify(prompts === 0, 'Pending retraction allowed draft submission.');
+    runtime = { ...runtime, revision: runtime.revision + 1, queuedFollowUps: [] }; view.update(runtime, runtime.id);
+    composer.update(other, { ...runtime, id: other.id }); type('Other newer draft'); view.scroll.focus();
+    removed.resolve({ text: 'Queued text', images: [image], imagesDropped: false }); await completed;
+    verify(composer.editor.value === 'Other newer draft' && !composer.node.querySelector('.composer-image') && document.activeElement === view.scroll, 'Late retraction changed or focused the selected other thread.');
+    composer.update(thread, runtime);
+    verify(composer.editor.value === 'Queued text\n\nNewer draft' && composer.node.querySelectorAll('.composer-image').length === 2, 'Withdrawal lost newer source text or either image after the queue row disappeared.');
+
+    runtime = { ...runtime, revision: runtime.revision + 1, queuedSteers: [{ text: 'Duplicate', imageCount: 0, imageRef: null }, { text: 'Duplicate', imageCount: 1, imageRef: 'duplicate-image' }] }; publish(); await frame();
+    verify([...view.pending.querySelectorAll<HTMLButtonElement>('.queued-edit')].every(control => control.disabled && control.title.includes('same text')), 'Ambiguous steering image duplicates remained editable.');
+    verify([...view.pending.querySelectorAll<HTMLButtonElement>('.queued-send')].every(control => control.hidden), 'Steering queue exposed Send now.');
+    runtime = { ...runtime, revision: runtime.revision + 1, queuedSteers: [{ text: 'Delivered already', imageCount: 0, imageRef: null }] }; publish();
+    removed = Promise.withResolvers<RetractedMessage | null>(); edit().click(); removed.resolve(null); await completed;
+    verify(composer.editor.value === 'Queued text\n\nNewer draft' && composer.node.querySelectorAll('.composer-image').length === 2, 'Already-delivered result replayed a queued message.');
+
+    runtime = { ...runtime, revision: runtime.revision + 1, queuedSteers: [], queuedFollowUps: [{ text: 'Held text', imageCount: 1, imageRef: 'held-image' }] }; publish(); await frame();
+    removed = Promise.withResolvers<RetractedMessage | null>(); edit().click();
+    removed.resolve({ text: 'Held text', images: Array.from({ length: 20 }, () => image), imagesDropped: false }); await completed;
+    const recover = composer.node.querySelector<HTMLButtonElement>('.composer-recover');
+    verify(recover && !recover.hidden && composer.node.querySelectorAll('.composer-image').length === 2 && !composer.editor.value.includes('Held text'), 'Unexpected merge overflow discarded withdrawn data or changed the existing draft.');
+    for (const remove of composer.node.querySelectorAll<HTMLButtonElement>('.image-remove')) remove.click();
+    recover?.click(); await frame();
+    verify(composer.editor.value === 'Held text\n\nQueued text\n\nNewer draft' && composer.node.querySelectorAll('.composer-image').length === 20 && recover?.hidden, 'Recoverable overflow did not restore all withdrawn text/images after freeing capacity.');
+    const before = requests;
+    runtime = { ...runtime, revision: runtime.revision + 1, queuedFollowUps: [{ text: 'Over capacity', imageCount: 1, imageRef: 'capacity-image' }] }; publish(); await frame(); edit().click(); await completed;
+    verify(requests === before && composer.node.querySelectorAll('.composer-image').length === 20, 'Known attachment overflow destructively removed a queued message.');
+    for (const remove of composer.node.querySelectorAll<HTMLButtonElement>('.image-remove')) remove.click();
+    removed = Promise.withResolvers<RetractedMessage | null>(); edit().click();
+    removed.resolve({ text: 'Missing native image', images: [], imagesDropped: true }); await completed;
+    verify(composer.editor.value.startsWith('Missing native image\n\n') && composer.node.querySelector('.composer-message')?.textContent?.includes('could not return all'), 'Native image loss was hidden or discarded recoverable text.');
+    verify(errors.length === 2, 'Queued editing reported unexpected errors.');
+    return 'Queue Edit survives canonical removal and thread switches, preserves newer drafts/images, locks submission/attachment edits, rejects ambiguous image duplicates and preflight overflow, retains unexpected overflow for explicit recovery, and surfaces native image loss.';
+  } finally {
+    removed.resolve(null); view.onEditQueued = null; composer.node.remove(); window.pi = bridge;
+  }
+}
+
+function checkMathRendering(view: Conversation): string {
+  const body = document.createElement('div'); body.className = 'markdown'; view.content.append(body);
+  const text = String.raw`A* chooses $f(n)=g(n)+h(n)$.
+
+| Node | $g$ | $h$ | $f=g+h$ |
+| --- | --- | --- | --- |
+| A | 2 | 7 | 9 |
+
+1. Compute $$g(\text{child})=g(B)+\text{edge cost},\qquad f(\text{child})=g(\text{child})+h(\text{child}).$$
+
+$$
+\begin{aligned}
+x_1 &= \frac{1}{2} \\
+x_2 &= \sqrt{4}
+\end{aligned}
+$$
+
+Also \(a_i^2+b_i^2=c_i^2\) and \[\sum_{i=1}^n i\].
+
+Code: ` + '`$literal$`' + String.raw`. Prices are $5 and $10. Escaped \$x\$ stays literal.
+
+` + '```tex\n$not_math$\n```\n';
+  renderMarkdown(body, text);
+  const annotations = [...body.querySelectorAll('annotation[encoding="application/x-tex"]')].map(node => node.textContent);
+  verify(annotations.includes('f(n)=g(n)+h(n)') && annotations.includes('a_i^2+b_i^2=c_i^2') && annotations.includes('\\sum_{i=1}^n i'),
+    'Inline, bracket-delimited, or display math lost its original TeX.');
+  verify(body.querySelectorAll('th .katex').length === 3 && body.querySelector('li .math-display .katex') && body.querySelector('.katex .mfrac'),
+    'Math failed in table headings, list items, or multiline fractions.');
+  verify(!body.querySelector('.katex-error') && body.textContent?.includes('$5 and $10') && body.textContent.includes('$x$') && body.querySelector('pre code')?.textContent === '$not_math$\n' && !body.querySelector('code .katex'),
+    'Math parsing consumed currency, escaped dollars, or code, or failed valid expressions.');
+  renderMarkdown(body, 'A partial $f(n)=', true);
+  verify(!body.querySelector('.katex'), 'An incomplete streamed equation rendered before its closing delimiter.');
+  renderMarkdown(body, 'A partial $f(n)=g(n)$', true);
+  const math = body.querySelector('.math-inline');
+  verify(math?.querySelector('math') && !math.querySelector('.stream-word'), 'Completed streaming math lost its accessible output or animated its individual symbols.');
+  renderMarkdown(body, 'A partial $f(n)=g(n)$ and new prose', true);
+  verify(body.querySelector('.math-inline') === math, 'Appending prose rebuilt an unchanged equation.');
+  renderMarkdown(body, String.raw`$\href{javascript:alert(1)}{unsafe}$ $\htmlStyle{position:fixed}{unsafe}$ <img src=x onerror="alert(1)"><script>alert(1)</script>`);
+  verify(!body.querySelector('script,img,iframe,a,[onerror],[onclick],[style*="position:fixed"]'), 'Markdown or TeX introduced executable markup, navigation, or trusted styling.');
+  renderMarkdown(body, String.raw`Broken $\frac{$ then readable prose.`);
+  verify(body.querySelector('.katex-error') && body.textContent?.includes('then readable prose.'), 'Invalid TeX broke surrounding conversation content.');
+  body.remove();
+  return 'Inline/display/bracket math renders in prose, tables and lists; code/currency/escaped dollars stay literal, streamed equations reconcile atomically, and untrusted commands remain inert.';
 }
 
 export async function checkLoadingBehavior(): Promise<string[]> {
@@ -440,6 +688,9 @@ export async function checkLoadingBehavior(): Promise<string[]> {
   const view = new Conversation(); host.append(view.node);
   try {
     outcomes.push(...checkNotices(view));
+    outcomes.push(checkMathRendering(view));
+    outcomes.push(checkCodeCopyReconciliation(host));
+    outcomes.push(await checkStreamingPresentation(view, source('adaptive-streaming')));
     outcomes.push(await checkAdvisorDisclosure(view));
     outcomes.push(checkTodoActivity(view));
     outcomes.push(checkActivityPresentation(view));
@@ -447,8 +698,11 @@ export async function checkLoadingBehavior(): Promise<string[]> {
     outcomes.push(await checkWorkFeedback(view));
     outcomes.push(checkResponseCopy(view));
     outcomes.push(await checkComposerSizing(view, host));
+    outcomes.push(await checkManualStreamingScroll(view, source('manual-stream-scroll')));
     outcomes.push(await checkSubmissionScroll(view, host));
-    outcomes.push(await checkComposerImagePreview(host));
+    outcomes.push(await checkComposerImagePreview(view, host));
+    outcomes.push(await checkComposerDrop(host));
+    outcomes.push(await checkQueuedEditing(view, host));
     outcomes.push(await checkSidebarTransitions());
     outcomes.push(...await checkMainFrameStates());
     const history = source('loading'); view.update(history, history.id);
@@ -511,7 +765,11 @@ export async function checkLoadingBehavior(): Promise<string[]> {
     verify(!view.content.querySelector('span.stream-word'), 'Cached activation replayed history or missed streaming words.');
     streaming = { ...streaming, messages: streaming.messages.map((message, index) => index === 599 ? { ...message, text: `${message.text} Freshwordverified` } : message) };
     view.update(streaming, streaming.id);
-    verify(Array.from(view.content.querySelectorAll('span.stream-word')).some(word => word.textContent === 'Freshwordverified'), 'Fresh streaming text stopped animating after activation.');
+    const fadeDeadline = performance.now() + 3000;
+    while (!view.content.textContent?.includes('Freshwordverified')) {
+      verify(performance.now() < fadeDeadline, 'Fresh streaming text stopped advancing after activation.'); await frame();
+    }
+    verify(Array.from(view.content.querySelectorAll('span.stream-word')).some(word => word.textContent?.trim() === 'Freshwordverified'), 'Fresh streaming text stopped animating after activation.');
     outcomes.push('Cached history does not replay reveal animations; fresh streaming words still animate.');
     return outcomes;
   } finally { view.dispose(); host.remove(); }

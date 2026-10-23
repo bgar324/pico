@@ -1,27 +1,30 @@
-import type { ChatMessage, ImageContent, RuntimeSnapshot, ToolActivity } from '../shared/types';
+import type { ChatMessage, RuntimeSnapshot, ToolActivity } from '../shared/types';
 import { isBusy } from '../shared/types';
 import { copy, element, iconButton, request } from './dom';
 import { renderMarkdown } from './markdown';
-import { icon, statusIcon, toolIcon } from './icons';
+import { StreamingText } from './streaming-text';
+import { disclosureCaret, icon, toolIcon } from './icons';
 import { isRuleNotice, renderBackgroundMessage } from './background-results';
-import { QueuedMessages } from './queued-messages';
+import { QueuedMessages, type QueuedEditRequest } from './queued-messages';
+import { MessageImages } from './message-images';
+import { SentMessageEditor } from './sent-message-editor';
 import { jsonRecord } from './helpers';
 import { WorkProgress } from './work-progress';
 import { TextShimmer } from './shimmer';
 import { SurfacePresence } from './surface-presence';
 import ompLogo from './omp-logo.svg';
 
-interface MessageView { node: HTMLElement; body: HTMLElement; images: HTMLElement; imageValues: readonly ImageContent[]; reasoning: HTMLElement; error: HTMLElement; value: ChatMessage }
-interface ToolView { node: HTMLDetailsElement; summary: HTMLElement; detail: HTMLElement; output: HTMLElement; value: ToolActivity }
-interface ActivityView { node: HTMLDetailsElement; label: HTMLElement; current: HTMLElement; state: HTMLElement; list: HTMLElement }
+interface MessageView { node: HTMLElement; body: HTMLElement; images: MessageImages; reasoning: HTMLElement; error: HTMLElement; value: ChatMessage; advisors: readonly ChatMessage[] | undefined }
+interface ToolView { node: HTMLDetailsElement; summary: HTMLElement; detail: HTMLElement; input: HTMLElement; output: HTMLElement; value: ToolActivity }
+interface ActivityView { node: HTMLDetailsElement; label: HTMLElement; current: HTMLElement; state: HTMLElement | null; list: HTMLElement }
 
 function createActivityView(): ActivityView {
   const node = element('details', 'activity-group'), summary = element('summary', 'activity-summary');
   const label = element('span', 'activity-label'), current = element('span', 'activity-current');
-  const state = element('span', 'activity-state'), list = element('div', 'activity-list');
+  const list = element('div', 'activity-list');
   current.hidden = true;
-  summary.append(label, current, state); node.append(summary, list);
-  return { node, label, current, state, list };
+  summary.append(label, current, disclosureCaret()); node.append(summary, list);
+  return { node, label, current, state: null, list };
 }
 
 function toolLabel(name: string): string {
@@ -44,6 +47,10 @@ function transcriptMessage(message: ChatMessage): boolean {
   });
 }
 
+function advisorMessage(message: ChatMessage): boolean {
+  return message.role === 'custom' && message.customType === 'advisor' && !message.isStreaming;
+}
+
 const INITIAL_MESSAGES = 60;
 const HISTORY_BATCH = 30;
 const ORPHAN_ACTIVITY = Symbol('unattached activity');
@@ -54,11 +61,16 @@ export class Conversation {
   private readonly backdrop = element('div', 'conversation-backdrop');
   private readonly work = new WorkProgress(this.content);
   private readonly shimmer = new TextShimmer();
-  private readonly queued = new QueuedMessages();
+  private readonly imageLoaded = (): void => { if (this.follow) this.scroll.scrollTop = this.scroll.scrollHeight; };
+  private readonly queued = new QueuedMessages(this.imageLoaded);
+  private readonly sentEditor = new SentMessageEditor(() => this.node.isConnected && !this.node.hidden, () => this.followLatest());
   readonly pending = this.queued.node;
+  set onEditQueued(callback: ((value: QueuedEditRequest) => Promise<void>) | null) { this.queued.onEdit = callback; }
   readonly jump = iconButton('arrow-down', 'Jump to latest', () => this.followLatest(), 'jump-latest');
   private threadID: string | null = null;
   private messages = new Map<string, MessageView>();
+  private readonly textStreams = new Map<HTMLElement, StreamingText>();
+  private readonly reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
   private tools = new Map<string, ToolView>();
   private activities = new Map<string | symbol, ActivityView>();
   private readonly responseActions = new Map<string, HTMLElement>();
@@ -100,19 +112,19 @@ export class Conversation {
       if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); this.closeFind(); }
     });
     this.scroll.addEventListener('scroll', () => {
-      if (this.restoringBottom) return;
-      this.follow = this.scroll.scrollHeight - this.scroll.clientHeight - this.scroll.scrollTop < 80; this.setJumpVisible(!this.follow);
+      const away = this.scroll.scrollHeight - this.scroll.clientHeight - this.scroll.scrollTop > 2;
+      if (away) this.pauseFollowing(); else this.setJumpVisible(false);
     }, { passive: true });
-    this.scroll.addEventListener('wheel', event => { if (event.deltaY < 0) { this.restoringBottom = false; this.follow = false; } }, { passive: true });
-    this.scroll.addEventListener('touchmove', () => { this.restoringBottom = false; this.follow = false; }, { passive: true });
-    this.scroll.addEventListener('keydown', event => { if (['Home', 'PageUp', 'ArrowUp'].includes(event.key)) { this.restoringBottom = false; this.follow = false; } });
+    this.scroll.addEventListener('wheel', event => { if (event.deltaY < 0) this.pauseFollowing(); }, { passive: true });
+    this.scroll.addEventListener('touchmove', () => this.pauseFollowing(), { passive: true });
+    this.scroll.addEventListener('keydown', event => { if (['Home', 'PageUp', 'ArrowUp'].includes(event.key) || event.key === ' ' && event.shiftKey) this.pauseFollowing(); });
     this.content.addEventListener('click', event => {
-      if (event.target instanceof Element && event.target.closest('summary')) { this.follow = false; this.restoringBottom = false; }
+      if (event.target instanceof Element && event.target.closest('summary')) this.pauseFollowing();
     });
     this.resizeObserver = new ResizeObserver(() => {
       // Keep viewport resizing at the bottom before paint, not in the next frame.
       if (this.follow || this.restoringBottom) this.scroll.scrollTop = this.scroll.scrollHeight;
-      else this.setJumpVisible(this.scroll.scrollHeight - this.scroll.clientHeight - this.scroll.scrollTop >= 80);
+      else this.setJumpVisible(this.scroll.scrollHeight - this.scroll.clientHeight - this.scroll.scrollTop > 2);
     });
     this.resizeObserver.observe(this.scroll);
     this.resizeObserver.observe(this.content);
@@ -135,12 +147,19 @@ export class Conversation {
     if (!visible && this.jump.contains(document.activeElement)) this.scroll.focus({ preventScroll: true });
     this.jumpPresence.setVisible(visible, instant);
   }
+  private pauseFollowing(): void {
+    this.follow = false; this.restoringBottom = false;
+    if (this.bottomFrame !== null) { cancelAnimationFrame(this.bottomFrame); this.bottomFrame = null; }
+    this.setJumpVisible(this.scroll.scrollHeight - this.scroll.clientHeight - this.scroll.scrollTop > 2);
+  }
   followLatest(): void {
     this.follow = true; this.restoringBottom = true;
     this.positionBottom(this.threadID);
   }
   activate(): void {
+    this.sentEditor.activate();
     this.follow = true; this.restoringBottom = true;
+    this.clearTextStreams(true);
     this.hydrated = false;
     const words = this.content.querySelectorAll('span.stream-word');
     for (const word of words) word.replaceWith(...word.childNodes);
@@ -153,11 +172,20 @@ export class Conversation {
   }
   dispose(): void {
     this.cancelHistory();
+    this.clearTextStreams(false);
     this.work.clear();
     this.shimmer.clear();
+    this.queued.dispose();
+    this.sentEditor.dispose();
+    for (const view of this.messages.values()) view.images.dispose();
     this.findPresence.dispose(); this.jumpPresence.dispose();
     if (this.bottomFrame !== null) cancelAnimationFrame(this.bottomFrame);
     this.resizeObserver.disconnect(); this.node.remove(); this.renderedRuntime = undefined;
+  }
+  // Cached inactive conversations still own queued image resources.
+  updateQueue(runtime: RuntimeSnapshot | undefined): void {
+    this.queued.update(runtime, this.threadID);
+    this.sentEditor.update(runtime, this.threadID);
   }
   update(runtime: RuntimeSnapshot | undefined, threadID: string | null): void {
     const changedThread = this.threadID !== threadID;
@@ -166,6 +194,7 @@ export class Conversation {
       // authoritative history, but use current connection/queue metadata.
       runtime = { ...runtime, messages: this.renderedRuntime.messages, tools: this.renderedRuntime.tools, subagents: this.renderedRuntime.subagents, ...(this.renderedRuntime.workPeriods ? { workPeriods: this.renderedRuntime.workPeriods } : {}) };
     }
+    this.sentEditor.update(runtime, threadID);
     this.backdrop.hidden = !threadID;
     const connection = runtime?.status.kind ?? 'connecting';
     if (this.backdrop.dataset.state !== connection) {
@@ -182,7 +211,9 @@ export class Conversation {
     this.renderedRuntime = runtime;
     if (changedThread) {
       this.cancelHistory(); this.initialHistoryPending = true; this.historyStart = 0;
+      this.clearTextStreams(false);
       if (threadID) this.node.dataset.threadId = threadID; else delete this.node.dataset.threadId;
+      for (const view of this.messages.values()) view.images.dispose();
       this.threadID = threadID; this.messages.clear(); this.tools.clear(); this.activities.clear(); this.responseActions.clear(); this.content.replaceChildren(); this.follow = true; this.hitIndex = -1; this.hydrated = false;
       this.work.clear();
       this.shimmer.clear();
@@ -196,14 +227,29 @@ export class Conversation {
       this.initialHistoryPending = false;
     }
     this.historyStart = Math.min(this.historyStart, Math.max(0, runtime.messages.length - 1));
-    const visible = (this.historyStart ? runtime.messages.slice(this.historyStart) : runtime.messages).filter(transcriptMessage);
+    const visible: ChatMessage[] = [];
+    const advisorBatches = new Map<string, ChatMessage[]>();
+    let batch: ChatMessage[] | undefined;
+    for (let index = this.historyStart; index < runtime.messages.length; index++) {
+      const message = runtime.messages[index];
+      if (!message || !transcriptMessage(message)) continue;
+      if (advisorMessage(message)) {
+        if (batch) { batch.push(message); continue; }
+        batch = [message]; advisorBatches.set(message.id, batch);
+      } else batch = undefined;
+      visible.push(message);
+    }
     const loading = this.historyStart > 0;
     if (this.historyLoading.hidden === loading) this.historyLoading.hidden = !loading;
     if (this.content.getAttribute('aria-busy') !== String(loading)) this.content.setAttribute('aria-busy', String(loading));
     const follow = this.follow || this.restoringBottom;
     const liveIDs = new Set(visible.map(message => message.id));
     const scrollPosition = this.scroll.scrollTop;
-    for (const [id, view] of this.messages) if (!liveIDs.has(id)) { view.node.remove(); this.messages.delete(id); }
+    for (const [id, view] of this.messages) if (!liveIDs.has(id)) {
+      this.sentEditor.remove(id);
+      this.stopTextStream(view.body); this.stopTextStream(view.reasoning);
+      view.images.dispose(); view.node.remove(); this.messages.delete(id);
+    }
     const tools = new Map(runtime.tools.filter(tool => tool.name !== 'todo' && tool.name !== 'set_todos').map(tool => [tool.id, tool]));
     const attached = new Set<string>();
     const activityTools = new Map<ActivityView, ToolActivity[]>();
@@ -214,7 +260,9 @@ export class Conversation {
     let activity: ActivityView | null = null;
     for (const message of visible) {
       let view = this.messages.get(message.id);
-      const changed = view?.value !== message;
+      const advisors = advisorBatches.get(message.id);
+      const advisorsChanged = advisors?.length !== view?.advisors?.length || !!advisors?.some((entry, index) => entry !== view?.advisors?.[index]);
+      const changed = view?.value !== message || advisorsChanged;
       const streaming = message.role === 'assistant' && message.isStreaming && this.hydrated;
       if (!view) {
         const node = element('article', message.role === 'user' ? 'message user-message' : 'message agent-message');
@@ -223,33 +271,39 @@ export class Conversation {
         const body = element('div', 'markdown'); const reasoning = element('div', 'reasoning markdown');
         reasoning.setAttribute('aria-label', 'Reasoning');
         const error = element('p', 'error-text');
-        const images = element('div', 'message-images');
-        node.append(reasoning, body, images, error); staged.append(node);
-        view = { node, body, images, imageValues: [], reasoning, error, value: message }; this.messages.set(message.id, view);
+        const images = new MessageImages(this.imageLoaded);
+        node.append(reasoning, body, images.node, error); staged.append(node);
+        if (message.role === 'user') {
+          const messageID = message.id;
+          const control = iconButton('copy', 'Copy message', () => {
+            if (!threadID) return;
+            return copy(() => request({ kind: 'copy-message', id: threadID, messageID }), control);
+          }, 'user-message-action user-message-copy');
+          const edit = iconButton('edit', 'Edit message', () => {
+            const current = this.messages.get(messageID);
+            if (!threadID || !current) return;
+            this.pauseFollowing();
+            this.sentEditor.open({ threadID, message: current.value, node, body, control: edit });
+          }, 'user-message-action user-message-edit');
+          node.append(edit, control);
+        }
+        view = { node, body, images, reasoning, error, value: message, advisors }; this.messages.set(message.id, view);
         if (message.text || message.customType) {
-          if (!renderBackgroundMessage(body, message)) renderMarkdown(body, message.text, streaming && this.hydrated);
+          if (!renderBackgroundMessage(body, message, advisors)) this.renderText(body, message.text, streaming && this.hydrated);
         }
-        if (message.thinking) renderMarkdown(reasoning, message.thinking, streaming && this.hydrated);
-      } else if (view.value !== message) {
-        if (view.value.text !== message.text || view.value.isStreaming !== message.isStreaming || view.value.role !== message.role || view.value.customType !== message.customType || view.value.details !== message.details) {
-          if (!renderBackgroundMessage(view.body, message)) renderMarkdown(view.body, message.text, streaming);
+        if (message.thinking) this.renderText(reasoning, message.thinking, streaming && this.hydrated);
+      } else if (changed) {
+        if (advisorsChanged || view.value.text !== message.text || view.value.isStreaming !== message.isStreaming || view.value.role !== message.role || view.value.customType !== message.customType || view.value.details !== message.details) {
+          if (!renderBackgroundMessage(view.body, message, advisors)) this.renderText(view.body, message.text, streaming, view.value.isStreaming ? view.value.text : message.text);
+          else this.stopTextStream(view.body);
         }
-        if (view.value.thinking !== message.thinking || view.value.isStreaming !== message.isStreaming) renderMarkdown(view.reasoning, message.thinking, streaming);
+        if (view.value.thinking !== message.thinking || view.value.isStreaming !== message.isStreaming) this.renderText(view.reasoning, message.thinking, streaming, view.value.isStreaming ? view.value.thinking : message.thinking);
         view.value = message;
+        view.advisors = advisors;
       }
       if (changed) {
         if (view.reasoning.hidden !== !message.thinking) view.reasoning.hidden = !message.thinking;
-        const imageContents = message.images ?? [];
-        if (view.imageValues.length !== imageContents.length || imageContents.some((image, index) => view.imageValues[index]?.data !== image.data || view.imageValues[index]?.mimeType !== image.mimeType)) {
-          view.images.replaceChildren(...imageContents.map((image, index) => {
-            const preview = element('img'); preview.src = `data:${image.mimeType};base64,${image.data}`;
-            preview.alt = `Attached image ${index + 1}`; preview.loading = 'lazy'; preview.decoding = 'async';
-            preview.addEventListener('load', () => { if (preview.isConnected && this.follow) this.scroll.scrollTop = this.scroll.scrollHeight; });
-            return preview;
-          }));
-          view.imageValues = imageContents;
-        }
-        if (view.images.hidden !== !imageContents.length) view.images.hidden = !imageContents.length;
+        view.images.update(message.images ?? []);
         const bodyHidden = !message.text && !message.customType;
         if (view.body.hidden !== bodyHidden) view.body.hidden = bodyHidden;
         if (view.error.textContent !== (message.error ?? '')) view.error.textContent = message.error;
@@ -290,23 +344,20 @@ export class Conversation {
         group.label.dataset.label = label; group.label.title = label; group.label.setAttribute('role', 'img'); group.label.setAttribute('aria-label', label);
         group.label.replaceChildren(icon('terminal'));
       }
-      const failed = actions.filter(tool => tool.state === 'failed').length;
+      const failed = actions.some(tool => tool.state === 'failed');
       const running = actions.findLast(tool => tool.state === 'running') ?? actions.findLast(tool => tool.state === 'pending');
       let latest = actions[0];
       for (const tool of actions) if (!latest || (tool.endedAt ?? tool.startedAt) >= (latest.endedAt ?? latest.startedAt)) latest = tool;
       const shown = running ?? latest;
       const interrupted = actions.some(tool => tool.state === 'interrupted');
-      const state = running ? 'running' : failed ? 'failed' : interrupted ? 'interrupted' : 'completed';
-      const stateClass = `activity-state ${state}`;
-      if (group.state.className !== stateClass) {
-        group.state.className = stateClass;
-        group.state.replaceChildren(...(state === 'failed' || state === 'interrupted' ? [statusIcon(state)] : []));
-      }
-      if (state === 'failed' || state === 'interrupted') {
+      if (!running && !failed && interrupted) {
+        if (!group.state) {
+          group.state = element('span', 'activity-state interrupted'); group.state.append(icon('circle-x'));
+          group.state.setAttribute('role', 'img'); group.state.setAttribute('aria-label', 'Interrupted'); group.state.title = 'Interrupted';
+        }
         if (!group.state.parentElement) group.label.parentElement?.append(group.state);
-      } else group.state.remove();
-      const status = running ? `Running · ${toolLabel(running.name)} ${running.target}${failed ? ` · ${failed} failed` : ''}` : failed ? `${failed} failed` : interrupted ? 'Interrupted' : 'Completed';
-      group.state.setAttribute('role', 'img'); group.state.setAttribute('aria-label', status); group.state.title = status;
+      } else group.state?.remove();
+      const status = running ? `Running · ${toolLabel(running.name)} ${running.target}` : failed ? 'Activity ended' : interrupted ? 'Interrupted' : 'Completed';
       group.label.parentElement?.setAttribute('aria-description', status);
       group.current.hidden = !shown;
       const currentAction = shown ? `${toolLabel(shown.name)}${shown.target ? ` ${shown.target}` : ''}` : '';
@@ -324,6 +375,35 @@ export class Conversation {
     if (follow) this.positionBottom(threadID);
     this.scheduleHistory();
   }
+  private stopTextStream(target: HTMLElement): void {
+    this.textStreams.get(target)?.destroy();
+    this.textStreams.delete(target);
+  }
+  private clearTextStreams(flush: boolean): void {
+    for (const stream of this.textStreams.values()) { if (flush) stream.flush(); else stream.destroy(); }
+    this.textStreams.clear();
+  }
+  private renderText(target: HTMLElement, text: string, streaming: boolean, previousText = text): void {
+    const animate = streaming && !this.reducedMotion.matches && !document.hidden;
+    if (!animate) {
+      this.stopTextStream(target);
+      renderMarkdown(target, text);
+      return;
+    }
+    let stream = this.textStreams.get(target);
+    if (!stream) {
+      if (previousText === text) renderMarkdown(target, text, true);
+      stream = new StreamingText(previousText, value => {
+        const top = this.scroll.scrollTop;
+        renderMarkdown(target, value, this.node.isConnected && !this.reducedMotion.matches && !document.hidden);
+        if (this.query) this.refreshFind(false);
+        if (this.follow || this.restoringBottom) this.positionBottom(this.threadID);
+        else this.scroll.scrollTop = top;
+      }, () => this.node.isConnected && !this.reducedMotion.matches && !document.hidden);
+      this.textStreams.set(target, stream);
+      stream.update(text);
+    } else stream.update(text);
+  }
   private updateResponseActions(runtime: RuntimeSnapshot): void {
     const live = new Set<string>();
     const activeTools = new Set(runtime.tools.filter(tool => tool.name !== 'todo' && tool.name !== 'set_todos' && (tool.state === 'pending' || tool.state === 'running')).map(tool => tool.id));
@@ -331,10 +411,10 @@ export class Conversation {
     let activeWork = false, unfinished = false;
     let response: ChatMessage | undefined;
     const finish = (nextUserID: string | null): void => {
-      if (!response || unfinished || activeWork || !this.messages.has(response.id)) return;
+      if (!response || unfinished || activeWork) return;
+      const responseView = this.messages.get(response.id);
+      if (!responseView) return;
       if (nextUserID === null && (isBusy(runtime.status) || runtime.status.kind === 'connecting' || activeTools.size)) return;
-      const before = nextUserID === null ? null : this.messages.get(nextUserID)?.node;
-      if (before === undefined) return;
       live.add(response.id);
       let actions = this.responseActions.get(response.id);
       if (!actions) {
@@ -346,9 +426,7 @@ export class Conversation {
         }, 'copy-message');
         actions.append(control); this.responseActions.set(messageID, actions);
       }
-      if (before === null) {
-        if (this.content.lastChild !== actions) this.content.append(actions);
-      } else if (actions.nextSibling !== before) this.content.insertBefore(actions, before);
+      if (actions.parentElement !== responseView.node) responseView.node.append(actions);
     };
     for (const message of runtime.messages) {
       if (!transcriptMessage(message)) continue;
@@ -378,6 +456,17 @@ export class Conversation {
       if (!current || !previous || !toolOnlyMessage(current) || !toolOnlyMessage(previous)) break;
       start--;
     }
+    // Do not initially render the tail of an Advisor batch as a separate card.
+    let first = start, message = runtime.messages[first];
+    while (message && !transcriptMessage(message)) message = runtime.messages[++first];
+    if (message && advisorMessage(message)) {
+      for (let previous = first - 1; previous >= 0; previous--) {
+        const message = runtime.messages[previous];
+        if (!message || !transcriptMessage(message)) continue;
+        if (!advisorMessage(message)) break;
+        start = previous;
+      }
+    }
     return start;
   }
   private cancelHistory(): void {
@@ -406,11 +495,11 @@ export class Conversation {
     let view = this.tools.get(tool.id);
     if (!view) {
       const node = element('details', 'tool'); node.dataset.toolId = tool.id;
-      const summary = element('summary'); const detail = element('pre', 'tool-detail'); const output = element('pre', 'tool-output');
+      const summary = element('summary'); const detail = element('pre', 'tool-detail'); const input = element('pre', 'tool-input'); const output = element('pre', 'tool-output');
       const detailBlock = element('div', 'tool-block'), outputBlock = element('div', 'tool-block');
-      detailBlock.append(detail); outputBlock.append(output);
+      detailBlock.append(detail, input); outputBlock.append(output);
       node.append(summary, detailBlock, outputBlock); host.append(node);
-      view = { node, summary, detail, output, value: tool }; this.tools.set(tool.id, view);
+      view = { node, summary, detail, input, output, value: tool }; this.tools.set(tool.id, view);
     } else if (view.node.parentElement !== host) {
       if (view.node.closest<HTMLDetailsElement>('.activity-group')?.open) {
         const nextGroup = host.closest<HTMLDetailsElement>('.activity-group'); if (nextGroup) nextGroup.open = true;
@@ -419,20 +508,28 @@ export class Conversation {
     }
     if (view.value !== tool || !view.summary.textContent) {
       const duration = tool.endedAt === null ? null : Math.max(0, (tool.endedAt - tool.startedAt) / 1000);
-      const status = tool.state === 'succeeded' ? [] : [element('span', `tool-status ${tool.state}`)];
-      for (const indicator of status) {
-        indicator.append(statusIcon(tool.state)); indicator.setAttribute('role', 'img'); indicator.setAttribute('aria-label', tool.state); indicator.title = tool.state;
-      }
       view.summary.title = duration !== null && duration >= 1 ? `Duration: ${duration.toFixed(1)}s` : '';
       view.summary.setAttribute('aria-description', tool.state);
-      view.summary.replaceChildren(toolIcon(tool.name), element('span', 'tool-name', toolLabel(tool.name)), element('span', 'tool-target', tool.target), ...status);
-      if (view.detail.textContent !== tool.detail) view.detail.textContent = tool.detail;
+      view.summary.replaceChildren(toolIcon(tool.name), element('span', 'tool-name', toolLabel(tool.name)), element('span', 'tool-target', tool.target), disclosureCaret());
+      if (view.detail.textContent !== tool.detail) {
+        const existing = view.detail.firstChild;
+        if (existing instanceof Text && tool.detail.startsWith(existing.data)) existing.appendData(tool.detail.slice(existing.length));
+        else view.detail.textContent = tool.detail;
+      }
+      const input = tool.input ?? '';
+      if (view.input.textContent !== input) {
+        const existing = view.input.firstChild;
+        if (existing instanceof Text && input.startsWith(existing.data)) existing.appendData(input.slice(existing.length));
+        else view.input.textContent = input;
+      }
+      view.detail.hidden = !tool.detail;
+      view.input.hidden = !input;
       if (view.output.textContent !== tool.output) {
         const existing = view.output.firstChild;
         if (existing instanceof Text && tool.output.startsWith(existing.data)) existing.appendData(tool.output.slice(existing.length));
         else view.output.textContent = tool.output;
       }
-      if (view.detail.parentElement) view.detail.parentElement.hidden = !tool.detail;
+      if (view.detail.parentElement) view.detail.parentElement.hidden = !tool.detail && !input;
       if (view.output.parentElement) view.output.parentElement.hidden = !tool.output;
       view.value = tool;
     }
@@ -463,7 +560,7 @@ export class Conversation {
     if (!hit) return;
     if (hit instanceof HTMLDetailsElement) hit.open = true;
     const needle = this.query.toLocaleLowerCase();
-    const candidates = Array.from(hit.querySelectorAll<HTMLElement>('.tool-detail,.tool-output,.result-raw,.result-metadata,.markdown :is(p,li,pre,h1,h2,h3,h4,h5,h6,dt,dd,td,th),.result-fields dt,.result-fields dd,.result-title,.notice-explanation,.notice-rule-name,.notice-rule-path'));
+    const candidates = Array.from(hit.querySelectorAll<HTMLElement>('.tool-detail,.tool-input,.tool-output,.result-raw,.result-metadata,.markdown :is(p,li,pre,h1,h2,h3,h4,h5,h6,dt,dd,td,th),.result-fields dt,.result-fields dd,.result-title,.notice-explanation,.notice-rule-name,.notice-rule-path'));
     const visibleMatch = hit.checkVisibility() && hit.innerText.toLocaleLowerCase().includes(needle);
     const target = candidates.find(node => node.checkVisibility() && node.innerText.toLocaleLowerCase().includes(needle))
       ?? (visibleMatch ? hit : candidates.find(node => (node.textContent ?? '').toLocaleLowerCase().includes(needle)) ?? hit);

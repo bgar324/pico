@@ -25,6 +25,7 @@ let initialLoaded = false;
 const initialEvents: UiEvent[] = [];
 let error = '';
 let dismissedAppError: string | undefined;
+const dismissedRecovery = new Map<string, string>();
 let loadError = '';
 const settings = new Settings();
 const dialogs = new AgentDialogs();
@@ -51,6 +52,7 @@ const composer = new Composer(showError, async () => {
   if (!runtime || runtime.status.kind !== 'ready') throw new Error(runtime?.error || 'OMP is not connected. Check Settings.');
   return { thread, runtime };
 }, id => { if (id === visibleConversationID) conversation.followLatest(); });
+emptyConversation.onEditQueued = value => composer.retractQueued(value);
 const sidebar = new Sidebar(showError, () => { if (app) settings.show(app); }, (id, expanded) => { void perform({ kind: 'project-expanded', id, expanded }); }, () => command('toggle-changes'));
 const changes = new Changes(() => { changesVisible = false; schedule(); });
 const titlebar = element('header', 'titlebar');
@@ -69,12 +71,20 @@ toolbar.append(sidebarToggle); titlebar.append(toolbar, titlebarDivider, titleba
 const workspace = element('div', 'workspace');
 const main = element('main', 'main');
 const todos = new TodoPanel(main, composer.node);
+titlebarChat.append(todos.controls);
 const recovery = element('div', 'runtime-recovery');
-const recoveryText = element('span'); const recoveryActions = element('div', 'recovery-actions'); recovery.append(recoveryText, recoveryActions);
+const recoveryText = element('span'); const recoveryActions = element('div', 'recovery-actions');
+recovery.append(recoveryText, recoveryActions, iconButton('close', 'Dismiss notice', () => {
+  if (!visibleConversationID) return;
+  dismissedRecovery.set(visibleConversationID, recovery.dataset.value ?? ''); schedule();
+  const editor = composer.node.querySelector('textarea');
+  if (editor?.checkVisibility() && !editor.disabled) editor.focus({ preventScroll: true });
+}));
 const notices = element('div', 'main-notices'); notices.append(errorBanner, recovery);
 const errorPresence = new SurfacePresence(errorBanner), recoveryPresence = new SurfacePresence(recovery);
 const empty = element('section', 'empty-state');
-main.append(notices, empty, conversation.node, composer.node, todos.rail, todos.controls); workspace.append(sidebar.node, main, changes.backdrop, changes.node); appRoot.append(titlebar, workspace);
+main.append(notices, empty, conversation.node, composer.node, todos.rail); workspace.append(sidebar.node, main, changes.backdrop, changes.node); appRoot.append(titlebar, workspace);
+const disposeComposerDrop = composer.bindDropTarget(main);
 const frameGeometry = new ResizeObserver(() => {
   const left = `${main.getBoundingClientRect().left}px`;
   const controlsEnd = `${toolbar.getBoundingClientRect().right + 8}px`;
@@ -91,6 +101,7 @@ function selectConversationView(id: string | null): void {
     if (id === null) conversation = emptyConversation;
     else {
       const cached = conversationViews.get(id) ?? new Conversation();
+      cached.onEditQueued = value => composer.retractQueued(value);
       conversationViews.delete(id); conversationViews.set(id, cached);
       conversation = cached;
     }
@@ -153,14 +164,15 @@ function render(): void {
   const modalChanges = changesVisible && !!path && window.innerWidth < 1180;
   if (modalChanges) composer.closeMenus();
   const focusOrigin = document.activeElement;
-  main.inert = modalChanges; sidebar.node.inert = modalChanges; toolbar.inert = modalChanges;
+  main.inert = modalChanges; sidebar.node.inert = modalChanges; toolbar.inert = modalChanges; todos.controls.inert = modalChanges;
   changes.update(path, changesVisible && !!path, focusOrigin);
   conversation.node.hidden = !thread; empty.hidden = !!thread;
   main.classList.toggle('empty-workspace', !thread);
   if (thread) {
     const recoveryValue = runtime?.error || runtime?.notice || (runtime?.status.kind === 'closed' ? runtime.status.reason || 'OMP is disconnected. Reopen this thread to resume.' : '');
-    recoveryPresence.setVisible(!!recoveryValue, changedThread); recoveryText.textContent = recoveryValue;
     const recoverySignature = `${thread.id}\0${runtime?.status.kind}\0${recoveryValue}`;
+    recoveryPresence.setVisible(!!recoveryValue && dismissedRecovery.get(thread.id) !== recoverySignature, changedThread); recoveryText.textContent = recoveryValue;
+    if (!recoveryValue) dismissedRecovery.delete(thread.id);
     if (recovery.dataset.value !== recoverySignature) {
       recovery.dataset.value = recoverySignature; recoveryActions.replaceChildren();
       if (runtime?.status.kind !== 'connecting') {
@@ -176,7 +188,7 @@ function render(): void {
       const actions = element('div', 'empty-actions');
       if (!currentApp.executablePath) {
         empty.append(element('h1', '', 'OMP connection unavailable'), element('p', 'muted', currentApp.connectionStatus));
-        actions.append(button('Choose OMP executable…', () => perform({ kind: 'choose-executable' }), 'primary'), button('Settings…', () => settings.show(currentApp)));
+        actions.append(button('Choose OMP executable…', () => perform({ kind: 'choose-executable' }), 'primary'), button('Settings…', () => command('settings')));
         const install = element('div', 'install-actions'); const control = iconButton('copy', 'Copy install command', () => copy('bun install -g @oh-my-pi/pi-coding-agent', control));
         install.append(iconButton('external-link', 'Installation instructions', () => perform({ kind: 'open-url', url: 'https://github.com/can1357/oh-my-pi#install' })), control); empty.append(actions, install);
       } else {
@@ -214,12 +226,23 @@ function command(value: UiCommand): void {
 }
 function consume(event: UiEvent): void {
   if (event.kind === 'command') { command(event.command); return; }
+  if (event.kind === 'connections') return;
   if (event.kind === 'app') {
     if (!app || event.snapshot.revision > app.revision) { app = event.snapshot; settings.update(event.snapshot); schedule(); }
     return;
   }
   if (!initialLoaded) { initialEvents.push(event); return; }
+  const previous = event.event.kind === 'summary' || event.event.kind === 'snapshot' ? runtimes.get(event.event.runtime.id) : undefined;
   if (reduceRuntime(runtimes, event.event)) {
+    if (event.event.kind === 'summary' || event.event.kind === 'snapshot') {
+      const next = event.event.runtime;
+      if (previous?.error !== next.error || previous?.notice !== next.notice || previous?.status.kind !== next.status.kind ||
+        previous.status.kind === 'closed' && next.status.kind === 'closed' && previous.status.reason !== next.status.reason) {
+        dismissedRecovery.delete(next.id);
+      }
+      const view = conversationViews.get(event.event.runtime.id);
+      if (view && (view !== conversation || event.event.runtime.id !== app?.manifest.selectedThreadID)) view.updateQueue(runtimes.get(event.event.runtime.id));
+    }
     if (event.event.kind === 'tool' && ['succeeded', 'failed', 'interrupted'].includes(event.event.tool.state)) {
       const threadID = event.event.threadID;
       const thread = app?.manifest.threads.find(record => record.id === threadID);
@@ -293,12 +316,16 @@ sidebar.resize.addEventListener('keydown', event => {
   appRoot.style.setProperty('--sidebar-width', `${width}px`); void saveSidebarSize(width, true);
 });
 window.addEventListener('beforeunload', () => {
+  disposeComposerDrop();
   frameGeometry.disconnect(); errorPresence.dispose(); recoveryPresence.dispose();
   sidebar.dispose(); todos.dispose(); changes.dispose(); emptyConversation.dispose();
   for (const view of conversationViews.values()) view.dispose();
 }, { once: true });
-main.addEventListener('dragover', event => { if (!app?.manifest.selectedThreadID && event.dataTransfer?.types.includes('Files')) event.preventDefault(); });
-main.addEventListener('drop', event => { if (app?.manifest.selectedThreadID) return; event.preventDefault(); for (const path of window.pi.pathsFromDrop(Array.from(event.dataTransfer?.files ?? []))) void perform({ kind: 'add-project', path }); });
+main.addEventListener('drop', event => {
+  if (app?.manifest.selectedThreadID || !event.dataTransfer || !Array.from(event.dataTransfer.items).every(item => item.webkitGetAsEntry()?.isDirectory)) return;
+  event.preventDefault();
+  for (const path of window.pi.pathsFromDrop(Array.from(event.dataTransfer.files))) void perform({ kind: 'add-project', path });
+});
 schedule();
 void request({ kind: 'snapshot' }).then(value => {
   if (!isAppSnapshot(value)) throw new Error('Pico returned an invalid initial snapshot.');

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ChatMessage, DialogRequest, Json, JsonRecord, ModelChoice, RuntimeEvent, RuntimeSnapshot, RuntimeSummary, ThreadRecord, WorkPeriod } from '../shared/types';
+import type { ChatMessage, DialogRequest, ImageContent, Json, JsonRecord, ModelChoice, RetractedMessage, RuntimeEvent, RuntimeSnapshot, RuntimeSummary, ThreadRecord, WorkPeriod } from '../shared/types';
 import { isBusy, isReady } from '../shared/types';
 import { RpcClient } from './RpcClient';
 import { isRecord, RpcError } from './frames';
@@ -7,7 +7,9 @@ import { MessageStore } from './MessageStore';
 import { dialogResponse, parseDialog } from './dialogs';
 import { sanitizeDiagnostic } from './diagnostics';
 import { committedTodoPhases, parseTodoPhases } from '../shared/todos';
-import { isImageContent } from '../shared/validation';
+import { IMAGE_TOTAL_BYTE_LIMIT, imageByteCount, isImageContent } from '../shared/validation';
+import { QueueAttachments, type QueueSnapshot } from './QueueAttachments';
+import { editableEntry } from './MessageEdit';
 
 interface LiveDialog { request: DialogRequest; token: string; timer: NodeJS.Timeout | undefined; submission: AbortController | null }
 interface StateRead { state: JsonRecord; generation: number; lifecycle: number; config: number; thinking: number; usage: number; title: number }
@@ -25,6 +27,9 @@ export class ThreadRuntime {
   private readonly dialogs = new Map<string, LiveDialog>();
   private readonly subagentParents = new Map<string, string>();
   private readonly pendingPrompts = new Set<string>();
+  private readonly streamingToolBlocks = new Map<string, Set<number>>();
+  private readonly queueAttachments = new QueueAttachments();
+  private queuePromotion: Promise<void> = Promise.resolve();
   private optimisticPrompt: { id: string; message: ChatMessage } | null = null;
   private readonly workPeriods: WorkPeriod[] = [];
   private unanchoredUserMessageID: string | null = null;
@@ -32,6 +37,7 @@ export class ThreadRuntime {
   private generation = 0;
   private lifecycleEpoch = 0;
   private configEpoch = 0;
+  private configurationChanges = 0;
   private thinkingRevision = 0;
   private titleRevision = 0;
   private sessionID: string | null = null;
@@ -39,6 +45,7 @@ export class ThreadRuntime {
   private naming: { name: string } | null = null;
   private titleCommandOutput: string | null = null;
   private nativeTitleRequest: { sessionID: string } | null = null;
+  private nativeTitleTask: Promise<void> | null = null;
   private modelRefresh: AbortController | null = null;
   private stateRead: Promise<StateRead> | null = null;
   private contextRefresh: Promise<void> | null = null;
@@ -46,12 +53,19 @@ export class ThreadRuntime {
   private activity: 'idle' | 'running' | 'background' | 'stopping' = 'idle';
   private historyBuffer: JsonRecord[] | null = null;
   private historyBoundarySeen = false;
+  private historyEditing = false;
 
   constructor(readonly record: ThreadRecord, private readonly emit: (event: RuntimeEvent) => void, initialRevision = 0) {
     this.recordID = record.id;
     this.state = { id: record.id, revision: initialRevision, status: { kind: 'closed', reason: null }, error: null, notice: null, models: [], selectedModelID: '', thinkingLevels: [], thinkingLevel: '', contextUsage: null, dialogs: [], subagents: [], todoPhases: [], queuedFollowUps: [], queuedSteers: [], workPeriods: this.workPeriods };
-    this.store = new MessageStore(message => this.emit({ kind: 'message', threadID: this.recordID, revision: ++this.state.revision, message: { ...message, toolIDs: [...message.toolIDs], ...(message.images ? { images: message.images.map(image => ({ ...image })) } : {}), ...(message.details ? { details: structuredClone(message.details) } : {}) } }), tool => this.emit({ kind: 'tool', threadID: this.recordID, revision: ++this.state.revision, tool: { ...tool } }));
+    this.store = new MessageStore(message => {
+      if (this.historyEditing) return;
+      this.emit({ kind: 'message', threadID: this.recordID, revision: ++this.state.revision, message: { ...message, toolIDs: [...message.toolIDs], ...(message.images ? { images: message.images.map(image => ({ ...image })) } : {}), ...(message.details ? { details: structuredClone(message.details) } : {}) } });
+    }, tool => {
+      if (!this.historyEditing) this.emit({ kind: 'tool', threadID: this.recordID, revision: ++this.state.revision, tool: { ...tool } });
+    });
     this.client.on('event', frame => {
+      if (this.state.status.kind === 'closed') return;
       if (this.historyBuffer && (frame.type === 'message_start' || frame.type === 'message_update' || frame.type === 'message_end' || (typeof frame.type === 'string' && frame.type.startsWith('tool_')))) {
         this.historyBuffer.push(frame);
       } else this.consume(frame);
@@ -61,14 +75,21 @@ export class ThreadRuntime {
     return { ...this.summary(), messages: [...this.store.messages.values(), ...(this.optimisticPrompt ? [this.optimisticPrompt.message] : [])].map(message => ({ ...message, toolIDs: [...message.toolIDs], ...(message.images ? { images: message.images.map(image => ({ ...image })) } : {}), ...(message.details ? { details: structuredClone(message.details) } : {}) })), tools: [...this.store.tools.values()].map(tool => ({ ...tool })) };
   }
   summary(): RuntimeSummary { return structuredClone(this.state); }
+  getQueuedImages(imageRef: string): readonly ImageContent[] { return this.queueAttachments.getImages(imageRef); }
   get sessionName(): string | null { return this.nativeSessionName; }
+  get canRefreshProviderConnections(): boolean {
+    return this.state.status.kind === 'closed' ||
+      (this.state.status.kind === 'ready' && this.state.status.activity === 'idle' && !this.historyEditing && !this.pendingPrompts.size && !this.client.hasPendingRequests &&
+        !this.dialogs.size && !this.naming && !this.nativeTitleTask && !this.modelRefresh && !this.configurationChanges &&
+        !this.state.queuedFollowUps.length && !this.state.queuedSteers.length);
+  }
 
-  async connect(executable: string): Promise<void> {
+  async connect(executable: string, reason: 'open' | 'provider-connections' = 'open'): Promise<void> {
     if (isReady(this.state.status) || this.state.status.kind === 'connecting') return;
     const generation = ++this.generation;
     this.lifecycleEpoch++; this.configEpoch++; this.contextUsageEpoch++;
     this.titleRevision++; this.sessionID = null; this.nativeSessionName = null; this.naming = null;
-    this.workPeriods.length = 0;
+    if (reason === 'open') this.workPeriods.length = 0;
     this.optimisticPrompt = null;
     this.unanchoredUserMessageID = null;
     this.advisorContinuationID = null;
@@ -76,7 +97,7 @@ export class ThreadRuntime {
     this.state.notice = this.record.wasRunning ? 'The previous process was interrupted. Saved history is restored; no action will be replayed.' : null;
     this.historyBuffer = []; this.historyBoundarySeen = false; this.changed();
     try {
-      await this.client.start({ executable, projectPath: this.record.projectPath, sessionDirectory: this.record.ompSessionDirectory, resume: true });
+      await this.client.start({ executable, projectPath: this.record.projectPath, sessionDirectory: this.record.ompSessionDirectory, resume: true, ...(this.record.ompSessionFile ? { sessionFile: this.record.ompSessionFile } : {}) });
       if (generation !== this.generation) return;
       const catalogEpoch = this.configEpoch;
       const catalog = await this.client.request('get_available_models', {}, { timeout: 60000 });
@@ -87,7 +108,6 @@ export class ThreadRuntime {
       const levels = await this.client.request('get_available_thinking_levels');
       if (generation !== this.generation) return;
       if (levelsEpoch === this.configEpoch && isRecord(levels) && Array.isArray(levels.levels)) this.state.thinkingLevels = levels.levels.filter((value): value is string => typeof value === 'string');
-      // Unsupported presentation optimizations must not prevent older engines from connecting.
       await this.client.request('set_event_filter', { events: null, messageUpdates: 'delta' }).catch(() => null);
       if (generation !== this.generation) return;
       await this.client.request('set_ask_dialog', { enabled: true }).catch(() => null);
@@ -109,10 +129,10 @@ export class ThreadRuntime {
       // History hydration can change state; read authoritative defaults and usage only after it completes.
       await this.refreshState();
       if (generation !== this.generation) return;
-      if (!this.state.models.length) this.state.notice = 'No models are available. Configure provider credentials with omp in Terminal, then reopen this thread.';
+      if (!this.state.models.length) this.state.notice = 'No models are available. Connect a provider in Settings → Connections.';
       this.state.status = { kind: 'ready', activity: this.activity };
       this.state.revision++; this.emit({ kind: 'snapshot', runtime: this.snapshot() });
-      this.maybeGenerateNativeTitle();
+      if (reason === 'open') this.maybeGenerateNativeTitle();
     } catch (error) {
       if (generation !== this.generation) return;
       this.state.error = sanitizeDiagnostic(error instanceof Error ? error.message : 'OMP failed to connect.');
@@ -153,15 +173,122 @@ export class ThreadRuntime {
     }
   }
 
+  private editIdleState(value: Json): JsonRecord {
+    if (!isRecord(value) || value.isSettled !== true || value.isStreaming === true || value.isCompacting === true || value.hasPendingAsyncWork === true ||
+        value.queuedMessageCount !== 0 || (typeof value.liveSteered === 'number' && value.liveSteered > 0) ||
+        !isRecord(value.queuedMessages) || !Array.isArray(value.queuedMessages.steering) || value.queuedMessages.steering.length ||
+        !Array.isArray(value.queuedMessages.followUp) || value.queuedMessages.followUp.length ||
+        !isReady(this.state.status) || isBusy(this.state.status) || this.state.queuedFollowUps.length || this.state.queuedSteers.length || this.pendingPrompts.size || this.configurationChanges || this.modelRefresh) {
+      throw new Error('Wait for current and queued work to finish before sending this edit.');
+    }
+    return value;
+  }
+
+  async editMessage(messageID: string, text: string): Promise<boolean> {
+    if (this.historyEditing || !isReady(this.state.status) || isBusy(this.state.status) || this.pendingPrompts.size || this.dialogs.size || this.nativeTitleTask || this.naming) throw new Error('Wait for the current work to finish before sending this edit.');
+    const source = this.store.userSource(messageID);
+    if (!source || this.store.messages.get(messageID)?.role !== 'user') throw new Error('This sent message is no longer available to edit.');
+    const generation = this.generation;
+    const oldPeriods = structuredClone(this.workPeriods);
+    let originalFile: string | null = null, transitioned = false, entered = false;
+    this.historyEditing = true;
+    try {
+      const state = this.editIdleState(await this.refreshState());
+      if (generation !== this.generation) return false;
+      if (typeof state.sessionFile !== 'string' || !state.sessionFile) throw new Error('Save this conversation before editing a sent message.');
+      originalFile = state.sessionFile; this.record.ompSessionFile = originalFile;
+      const entry = editableEntry(await this.client.request('get_entries'), source);
+      if (generation !== this.generation) return false;
+      const nativeMessage = entry.message;
+      const images: JsonRecord[] = [];
+      if (Array.isArray(nativeMessage.content)) for (const block of nativeMessage.content) {
+        if (isRecord(block) && block.type === 'image') {
+          if (!isImageContent(block)) throw new Error('This message has an image that cannot be resent safely.');
+          images.push(block);
+        }
+      }
+      if (!text.trim() && !images.length) throw new Error('Enter a message to send.');
+      const fields: JsonRecord = { message: text, ...(images.length ? { images } : {}) };
+      if (Buffer.byteLength(JSON.stringify({ ...fields, type: 'prompt', id: randomUUID() }) + '\n') > this.client.maxInputFrameBytes) throw new Error("This edit exceeds OMP's input limit. Shorten the message before resending.");
+      // History reads can be slow; branch itself has no native busy refusal.
+      const checked = this.editIdleState(await this.client.request('get_state'));
+      if (generation !== this.generation) return false;
+      if (checked.sessionFile !== originalFile || checked.sessionId !== state.sessionId) throw new Error('The active conversation changed while preparing this edit. No message was resent.');
+      this.historyBuffer = []; this.historyBoundarySeen = false;
+      const branched = await this.client.request('branch', { entryId: entry.id });
+      if (!isRecord(branched) || typeof branched.cancelled !== 'boolean') throw new RpcError('protocol', 'OMP returned an invalid branch result.');
+      if (branched.cancelled) throw new Error('OMP cancelled the edit. Your original conversation is unchanged.');
+      transitioned = true;
+      this.lifecycleEpoch++; this.contextUsageEpoch++; this.titleRevision++;
+      const branchState = await this.refreshState();
+      if (generation !== this.generation) return false;
+      if (typeof branchState?.sessionFile !== 'string' || branchState.sessionFile === originalFile) throw new RpcError('protocol', 'OMP did not create a separate edited conversation.');
+      this.record.ompSessionFile = branchState.sessionFile;
+      const prefix = await this.loadHistory();
+      if (generation !== this.generation) return false;
+      this.workPeriods.length = 0;
+      const accepted = await this.submitPrompt(text, { images });
+      if (generation !== this.generation) return false;
+      const buffered = this.historyBuffer ?? [];
+      entered = accepted || this.pendingPrompts.size > 0 || buffered.some(frame => (frame.type === 'message_start' || frame.type === 'message_end') && isRecord(frame.message) && frame.message.role === 'user');
+      if (!entered) throw new Error(this.state.error ?? 'OMP did not admit the edited message. Your edit is still here.');
+      // A lost acknowledgement is not permission to replay or roll back a possibly admitted turn.
+      if (!accepted) this.state.notice = 'The edited message may have been admitted. Do not resend it while OMP resolves its current work.';
+      this.store.restore(prefix); this.state.subagents = []; this.subagentParents.clear();
+      this.historyBuffer = null;
+      for (const frame of buffered) this.consume(frame);
+      this.historyEditing = false;
+      this.messagesChanged();
+      this.onActivity?.();
+      return true;
+    } catch (failure) {
+      if (generation !== this.generation) return false;
+      // Hooks may throw after changing sessions. Read back instead of assuming no transition.
+      if (originalFile && !entered) {
+        try {
+          const current = await this.client.request('get_state');
+          if (!isRecord(current)) throw new Error('OMP could not identify the active session.');
+          if (current.sessionFile !== originalFile) {
+            const rollback = await this.client.request('switch_session', { sessionPath: originalFile });
+            if (!isRecord(rollback) || rollback.cancelled !== false) throw new Error('OMP cancelled restoring the original conversation.');
+            const restored = await this.client.request('get_state');
+            if (!isRecord(restored) || restored.sessionFile !== originalFile) throw new Error('OMP did not restore the original conversation.');
+          }
+          this.record.ompSessionFile = originalFile;
+          this.workPeriods.splice(0, this.workPeriods.length, ...oldPeriods);
+          this.optimisticPrompt = null;
+          this.lifecycleEpoch++; this.contextUsageEpoch++; this.titleRevision++;
+          await this.refreshState();
+        } catch (rollbackFailure) {
+          this.state.notice = 'The original branch is saved, but restoring it failed. Keep your edit and reopen this conversation before continuing.';
+          this.state.error = sanitizeDiagnostic(rollbackFailure instanceof Error ? rollbackFailure.message : 'OMP could not restore the original conversation.');
+          await this.shutdown();
+          throw new Error(this.state.notice);
+        }
+      }
+      if (transitioned) this.state.error = null;
+      throw failure;
+    } finally {
+      if (generation === this.generation) { this.historyBuffer = null; this.historyEditing = false; this.changed(); }
+      else this.historyEditing = false;
+    }
+  }
+
   async sendPrompt(message: string, options: { steer?: boolean; images?: JsonRecord[] } = {}): Promise<boolean> {
+    if (this.historyEditing) return false;
+    return this.submitPrompt(message, options);
+  }
+  private async submitPrompt(message: string, options: { steer?: boolean; images?: JsonRecord[] } = {}): Promise<boolean> {
     if (!isReady(this.state.status) || (!message.trim() && !options.images?.length)) return false;
     const generation = this.generation, id = randomUUID(), busy = isBusy(this.state.status);
+    const images = options.images?.filter(isImageContent) ?? [];
     this.lifecycleEpoch++; this.pendingPrompts.add(id); this.activity = 'running';
+    if (busy) this.queueAttachments.submitted(id, options.steer ? 'steering' : 'followUp', message, images);
     this.unanchoredUserMessageID = null;
     if (!busy) this.advisorContinuationID = null;
     if (!busy) {
       const messageID = `pending-${id}`;
-      this.optimisticPrompt = { id, message: { id: messageID, role: 'user', text: message, thinking: '', error: null, isStreaming: false, toolIDs: [], ...(options.images ? { images: options.images.filter(isImageContent) } : {}) } };
+      this.optimisticPrompt = { id, message: { id: messageID, role: 'user', text: message, thinking: '', error: null, isStreaming: false, toolIDs: [], ...(options.images ? { images } : {}) } };
       this.unanchoredUserMessageID = messageID;
     }
     this.beginWork();
@@ -173,12 +300,23 @@ export class ThreadRuntime {
     try {
       const result = await this.client.request('prompt', fields, { id, timeout: 60000 });
       if (generation !== this.generation) return false;
-      if (isRecord(result) && result.agentInvoked === false) { this.discardOptimisticPrompt(id); this.pendingPrompts.delete(id); this.lifecycleEpoch++; await this.refreshState(); }
+      if (isRecord(result) && result.agentInvoked === false) {
+        this.queueAttachments.rejected(id);
+        this.applyQueueSnapshot(this.queueAttachments.snapshot());
+        this.discardOptimisticPrompt(id); this.pendingPrompts.delete(id); this.lifecycleEpoch++; await this.refreshState();
+      } else if (busy) {
+        this.queueAttachments.admitted(id, ++this.lifecycleEpoch);
+        this.refreshContextUsage();
+      }
       if (generation !== this.generation) return false;
       this.onActivity?.(); this.changed(); return true;
     } catch (error) {
       if (generation !== this.generation) return false;
-      if (!(error instanceof RpcError && error.kind === 'timeout')) { this.discardOptimisticPrompt(id); this.pendingPrompts.delete(id); this.lifecycleEpoch++; }
+      if (!(error instanceof RpcError && error.kind === 'timeout')) {
+        this.queueAttachments.rejected(id);
+        this.applyQueueSnapshot(this.queueAttachments.snapshot());
+        this.discardOptimisticPrompt(id); this.pendingPrompts.delete(id); this.lifecycleEpoch++;
+      }
       this.state.error = sanitizeDiagnostic(error instanceof Error ? error.message : 'OMP rejected the prompt.');
       const state = await this.refreshState(5000).catch(() => null);
       if (generation !== this.generation) return false;
@@ -195,20 +333,79 @@ export class ThreadRuntime {
     catch (error) { if (generation === this.generation) this.state.error = sanitizeDiagnostic(error instanceof Error ? error.message : 'OMP could not stop.'); }
     if (generation === this.generation) this.changed();
   }
-  async promoteQueued(message: string): Promise<boolean> {
-    if (!isReady(this.state.status) || !this.state.queuedFollowUps.includes(message)) return false;
+  promoteQueued(message: string): Promise<boolean> {
     const generation = this.generation;
-    const result = await this.client.request('promote_queued_message', { message });
-    if (generation !== this.generation) return false;
-    if (!isRecord(result) || typeof result.promoted !== 'boolean') throw new RpcError('protocol', 'OMP returned an invalid queue promotion result.');
-    await this.refreshState();
-    return result.promoted;
+    const operation = this.queuePromotion.then(async () => {
+      if (generation !== this.generation || !isReady(this.state.status) || !this.state.queuedFollowUps.some(entry => entry.text === message)) return false;
+      const promotion = this.queueAttachments.promote(message);
+      this.lifecycleEpoch++;
+      try {
+        const result = await this.client.request('promote_queued_message', { message });
+        if (generation !== this.generation) return false;
+        if (!isRecord(result) || typeof result.promoted !== 'boolean') throw new RpcError('protocol', 'OMP returned an invalid queue promotion result.');
+        await this.refreshState();
+        if (generation === this.generation) this.changed();
+        return result.promoted;
+      } finally { this.queueAttachments.finishPromotion(promotion); }
+    });
+    this.queuePromotion = operation.then(() => {}, () => {});
+    return operation;
+  }
+  retractQueued(queue: 'steering' | 'followUp', message: string, imageRef: string | null): Promise<RetractedMessage | null> {
+    const generation = this.generation;
+    const operation = this.queuePromotion.then(async () => {
+      if (generation !== this.generation || !isReady(this.state.status)) return null;
+      await this.refreshState();
+      if (generation !== this.generation || !isReady(this.state.status)) return null;
+      const retraction = this.queueAttachments.prepareRetraction(queue, message, imageRef);
+      if (!retraction) return null;
+      let restored: RetractedMessage | null = null;
+      this.lifecycleEpoch++;
+      try {
+        const result = await this.client.request('remove_queued_message', { queue, message: retraction.entry.text });
+        if (generation !== this.generation || !isReady(this.state.status)) return null;
+        if (!isRecord(result) || typeof result.removed !== 'boolean' ||
+            (result.imagesDropped !== undefined && typeof result.imagesDropped !== 'boolean')) {
+          throw new RpcError('protocol', 'OMP returned an invalid queue removal result.');
+        }
+        let images: ImageContent[] = [];
+        if (result.images !== undefined) {
+          if (!Array.isArray(result.images) || result.images.length > 20 || !result.images.every(isImageContent) ||
+              result.images.reduce((total, image) => total + imageByteCount(image), 0) > IMAGE_TOTAL_BYTE_LIMIT) {
+            throw new RpcError('protocol', 'OMP returned invalid images for the removed message.');
+          }
+          images = result.images;
+        }
+        if (result.removed) {
+          // queue_update can release the tracked preview before this response.
+          if (!images.length && result.imagesDropped === true) images = retraction.images.map(image => ({ ...image }));
+          restored = { text: retraction.entry.text, images, imagesDropped: result.imagesDropped === true && !images.length };
+          this.applyQueueSnapshot(this.queueAttachments.finishRetraction(retraction));
+        }
+      } catch (error) {
+        if (generation === this.generation && isReady(this.state.status)) throw error;
+      } finally {
+        this.queueAttachments.cancelRetraction(retraction);
+        if (generation === this.generation && isReady(this.state.status)) {
+          this.lifecycleEpoch++;
+          try { await this.refreshState(); }
+          catch (error) {
+            if (generation === this.generation) this.state.error = sanitizeDiagnostic(error instanceof Error ? error.message : 'OMP could not refresh its queues.');
+          }
+          if (generation === this.generation) this.changed();
+        }
+      }
+      return generation === this.generation && isReady(this.state.status) ? restored : null;
+    });
+    this.queuePromotion = operation.then(() => {}, () => {});
+    return operation;
   }
   async selectModel(id: string): Promise<void> {
     const model = this.state.models.find(choice => choice.id === id);
     if (!isReady(this.state.status) || !model) return;
     const generation = this.generation;
     this.modelRefresh?.abort(); const epoch = ++this.configEpoch; this.contextUsageEpoch++;
+    this.configurationChanges++;
     try {
       await this.client.request('set_model', { provider: model.provider, modelId: model.modelID }, { timeout: 60000 });
       if (generation !== this.generation) return;
@@ -217,14 +414,17 @@ export class ThreadRuntime {
       if (generation !== this.generation) return;
       this.state.error = null; this.onActivity?.();
     } catch (error) { if (generation === this.generation && epoch <= this.configEpoch) this.state.error = sanitizeDiagnostic(error instanceof Error ? error.message : 'OMP could not select the model.'); }
+    finally { this.configurationChanges--; }
     if (generation === this.generation) this.changed();
   }
   async selectThinking(level: string): Promise<void> {
     // RPC accepts inherit as a reset even though capability discovery omits it.
     if (!isReady(this.state.status) || (level !== 'inherit' && !this.state.thinkingLevels.includes(level))) return;
     const generation = this.generation;
+    this.configurationChanges++;
     try { await this.client.request('set_thinking_level', { level }); if (generation !== this.generation) return; await this.refreshState(); this.state.error = null; }
     catch (error) { if (generation === this.generation) this.state.error = sanitizeDiagnostic(error instanceof Error ? error.message : 'OMP could not select thinking effort.'); }
+    finally { this.configurationChanges--; }
     if (generation === this.generation) this.changed();
   }
   async setSessionName(name: string): Promise<void> {
@@ -242,7 +442,9 @@ export class ThreadRuntime {
     } catch (error) {
       if (generation === this.generation) { this.state.error = sanitizeDiagnostic(error instanceof Error ? error.message : 'OMP could not rename the conversation.'); this.changed(); }
       throw error;
-    } finally { if (this.naming === naming) this.naming = null; }
+    } finally {
+      if (this.naming === naming) { this.naming = null; this.onActivity?.(); }
+    }
   }
   async refreshState(timeout = 30000): Promise<JsonRecord | null> {
     const generation = this.generation, lifecycle = this.lifecycleEpoch, config = this.configEpoch, thinking = this.thinkingRevision, usage = this.contextUsageEpoch;
@@ -288,7 +490,7 @@ export class ThreadRuntime {
     this.record.nativeTitleAttemptedFor = sessionID;
     const request = { sessionID }; this.nativeTitleRequest = request;
     const current = (): boolean => this.nativeTitleRequest === request && generation === this.generation && sessionID === this.sessionID && isReady(this.state.status);
-    void (async () => {
+    const task = (async () => {
       const available = await this.client.request('get_available_commands');
       if (!current()) return;
       if (this.nativeSessionName || this.naming) { this.nativeTitleRequest = null; return; }
@@ -303,7 +505,10 @@ export class ThreadRuntime {
       if (this.nativeSessionName) return;
       this.state.notice = sanitizeDiagnostic(`OMP could not generate a chat title: ${error instanceof Error ? error.message : String(error)} The provisional title was kept.`);
       this.changed();
+    }).finally(() => {
+      if (this.nativeTitleTask === task) { this.nativeTitleTask = null; this.onActivity?.(); }
     });
+    this.nativeTitleTask = task;
   }
   private applyContextUsage(read: StateRead): boolean {
     if (read.generation !== this.generation || read.config !== this.configEpoch || read.usage !== this.contextUsageEpoch || this.state.status.kind === 'closed') return false;
@@ -324,7 +529,7 @@ export class ThreadRuntime {
   }
   private applyQueueState(read: StateRead): boolean {
     if (read.generation !== this.generation || read.lifecycle !== this.lifecycleEpoch || this.state.status.kind === 'closed' || !isRecord(read.state.queuedMessages)) return false;
-    return this.applyQueues(read.state.queuedMessages);
+    return this.applyQueues(read.state.queuedMessages, read.lifecycle);
   }
   private refreshContextUsage(): void {
     this.contextUsageEpoch++;
@@ -405,7 +610,34 @@ export class ThreadRuntime {
     return { id: `${value.provider}/${value.id}`, provider: value.provider, modelID: value.id, name: typeof value.name === 'string' ? value.name : value.id, supportsImages: Array.isArray(value.input) && value.input.includes('image') };
   }
 
+  private updateToolStreamMode(frame: JsonRecord): void {
+    const wasStreaming = this.streamingToolBlocks.size > 0;
+    if (frame.type === 'agent_end') this.streamingToolBlocks.clear();
+    else if (typeof frame.messageId === 'string') {
+      if (frame.type === 'message_end') this.streamingToolBlocks.delete(frame.messageId);
+      else if (frame.type === 'message_update' && isRecord(frame.assistantMessageEvent)) {
+        const event = frame.assistantMessageEvent, index = event.contentIndex;
+        if (typeof index !== 'number' || !Number.isSafeInteger(index) || index < 0) return;
+        if (event.type === 'toolcall_start' || event.type === 'toolcall_delta') {
+          const blocks = this.streamingToolBlocks.get(frame.messageId) ?? new Set<number>();
+          blocks.add(index); this.streamingToolBlocks.set(frame.messageId, blocks);
+        } else if (event.type === 'toolcall_end') {
+          const blocks = this.streamingToolBlocks.get(frame.messageId);
+          blocks?.delete(index);
+          if (!blocks?.size) this.streamingToolBlocks.delete(frame.messageId);
+        }
+      }
+    }
+    const streaming = this.streamingToolBlocks.size > 0;
+    if (wasStreaming !== streaming) {
+      // Delta tool events omit identity and parsed arguments. Request snapshots only
+      // while arguments stream, then restore delta transport for prose and reasoning.
+      void this.client.request('set_event_filter', { events: null, messageUpdates: streaming ? 'full' : 'delta' }).catch(() => null);
+    }
+  }
+
   consume(frame: JsonRecord): void {
+    this.updateToolStreamMode(frame);
     switch (frame.type) {
       case 'message_start':
       case 'message_end': {
@@ -466,8 +698,16 @@ export class ThreadRuntime {
         if (frame.command === 'get_messages' || frame.command === 'get_messages_page') return;
         if (frame.success === true && frame.command === 'compact') { this.refreshContextUsage(); return; }
         if (frame.success === false) this.state.error = sanitizeDiagnostic(typeof frame.error === 'string' ? frame.error : 'OMP rejected a command.');
-        if (typeof frame.id === 'string' && (frame.command === 'prompt' || frame.command === 'abort_and_prompt') && (frame.success === false || (isRecord(frame.data) && frame.data.agentInvoked === false)) && this.pendingPrompts.delete(frame.id)) { this.discardOptimisticPrompt(frame.id); this.lifecycleEpoch++; void this.refreshState().then(() => this.changed()).catch(() => this.changed()); }
-        else return;
+        if (typeof frame.id !== 'string' || (frame.command !== 'prompt' && frame.command !== 'abort_and_prompt')) return;
+        if (frame.success === false || (isRecord(frame.data) && frame.data.agentInvoked === false)) {
+          this.queueAttachments.rejected(frame.id);
+          this.applyQueueSnapshot(this.queueAttachments.snapshot());
+          this.pendingPrompts.delete(frame.id); this.discardOptimisticPrompt(frame.id);
+          this.lifecycleEpoch++; void this.refreshState().then(() => this.changed()).catch(() => this.changed());
+        } else if (frame.success === true) {
+          this.queueAttachments.admitted(frame.id, ++this.lifecycleEpoch);
+          this.refreshContextUsage();
+        } else return;
         break;
       }
       case 'transport_error': this.lifecycleEpoch++; this.state.error = sanitizeDiagnostic(typeof frame.error === 'string' ? frame.error : 'OMP disconnected. Reopen the thread.'); this.state.status = { kind: 'closed', reason: this.state.error }; this.interrupt(); break;
@@ -516,7 +756,7 @@ export class ThreadRuntime {
     for (const period of this.workPeriods) if (period.messageID === pending.message.id) period.messageID = null;
     this.messagesChanged();
   }
-  private messagesChanged(): void { this.state.revision++; this.emit({ kind: 'snapshot', runtime: this.snapshot() }); }
+  private messagesChanged(): void { if (!this.historyEditing) { this.state.revision++; this.emit({ kind: 'snapshot', runtime: this.snapshot() }); } }
 
   private beginWork(): void {
     if (this.state.status.kind === 'closed') return;
@@ -558,11 +798,15 @@ export class ThreadRuntime {
     if (this.state.notice === 'Stopping. Waiting for OMP to settle its work.' || this.state.notice === 'Turn finished. Background work is still running.') this.state.notice = null;
     this.onActivity?.();
   }
-  private applyQueues(frame: JsonRecord): boolean {
+  private applyQueues(frame: JsonRecord, observedAt?: number): boolean {
     const steering = Array.isArray(frame.steering) ? frame.steering.filter((value): value is string => typeof value === 'string') : [];
     const followUp = Array.isArray(frame.followUp) ? frame.followUp.filter((value): value is string => typeof value === 'string') : [];
+    return this.applyQueueSnapshot(this.queueAttachments.reconcile(steering, followUp, observedAt));
+  }
+  private applyQueueSnapshot({ steering, followUp }: QueueSnapshot): boolean {
     if (steering.length === this.state.queuedSteers.length && followUp.length === this.state.queuedFollowUps.length &&
-      steering.every((text, index) => text === this.state.queuedSteers[index]) && followUp.every((text, index) => text === this.state.queuedFollowUps[index])) return false;
+      steering.every((entry, index) => entry.text === this.state.queuedSteers[index]?.text && entry.imageCount === this.state.queuedSteers[index]?.imageCount && entry.imageRef === this.state.queuedSteers[index]?.imageRef) &&
+      followUp.every((entry, index) => entry.text === this.state.queuedFollowUps[index]?.text && entry.imageCount === this.state.queuedFollowUps[index]?.imageCount && entry.imageRef === this.state.queuedFollowUps[index]?.imageRef)) return false;
     this.state.queuedSteers = steering; this.state.queuedFollowUps = followUp;
     return true;
   }
@@ -607,8 +851,8 @@ export class ThreadRuntime {
       case 'setStatus': this.state.notice = typeof frame.statusText === 'string' ? sanitizeDiagnostic(frame.statusText) : null; return;
       case 'setWidget': this.state.notice = Array.isArray(frame.widgetLines) ? sanitizeDiagnostic(frame.widgetLines.filter((line): line is string => typeof line === 'string').join('\n')) : null; return;
       case 'setTitle': return;
-      case 'set_editor_text': if (typeof frame.text === 'string') this.onEditorText?.(frame.text); return;
-      case 'open_url': this.state.notice = 'Provider sign-in requires Terminal. Open this session in Terminal and use omp login.'; return;
+      case 'set_editor_text': if (!this.historyEditing && typeof frame.text === 'string') this.onEditorText?.(frame.text); return;
+      case 'open_url': this.state.notice = 'Connect provider accounts in Settings → Connections.'; return;
     }
     const request = parseDialog(frame);
     if (!request || this.dialogs.has(request.id)) {
@@ -673,11 +917,13 @@ export class ThreadRuntime {
     if (this.optimisticPrompt) this.discardOptimisticPrompt(this.optimisticPrompt.id);
     this.finishWork();
     this.modelRefresh?.abort(); this.modelRefresh = null; this.historyBuffer = null; this.pendingPrompts.clear();
-    this.titleRevision++; this.naming = null; this.titleCommandOutput = null; this.nativeTitleRequest = null;
+    this.titleRevision++; this.naming = null; this.titleCommandOutput = null; this.nativeTitleRequest = null; this.nativeTitleTask = null;
     this.contextUsageEpoch++; this.state.contextUsage = null; this.stateRead = null; this.contextRefresh = null;
+    this.streamingToolBlocks.clear();
     this.store.interrupt(); this.activity = 'idle';
     for (const id of this.dialogs.keys()) this.removeDialog(id);
     this.state.queuedFollowUps = []; this.state.queuedSteers = [];
+    this.queueAttachments.reset();
     for (const agent of this.state.subagents) if (agent.status === 'active' || agent.status === 'running' || agent.status === 'started') agent.status = 'interrupted';
   }
   private changed(): void { this.state.revision++; this.emit({ kind: 'summary', runtime: this.summary() }); }

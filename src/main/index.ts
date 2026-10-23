@@ -8,6 +8,8 @@ import { AppController, type DesktopHost } from './AppController';
 import { DesktopActions } from './actions';
 import { NativeContextMenu } from './NativeContextMenu';
 import { Persistence } from '../services/Persistence';
+import { ProviderConnections } from '../services/ProviderConnections';
+import { resolveExecutable } from '../services/executable';
 import { isImageContent, parseRequest } from '../shared/validation';
 import { sanitizeDiagnostic } from '../omp/diagnostics';
 import type { BridgeResult, ImageContent, JsonRecord, ThreadRecord, UiCommand, UiEvent } from '../shared/types';
@@ -32,6 +34,8 @@ const rendererUrl = pathToFileURL(rendererFile).href;
 let window: BrowserWindow | null = null;
 let controller: AppController | null = null;
 let contextMenu: NativeContextMenu | null = null;
+let providerConnections: ProviderConnections | null = null;
+let pendingConnectionId: string | null = null;
 let quitting = false;
 
 async function decodeRasterImage(image: ImageContent): Promise<Electron.NativeImage> {
@@ -147,7 +151,12 @@ function createWindow(): BrowserWindow {
   next.webContents.on('will-navigate', (event, url) => { if (url !== rendererUrl) event.preventDefault(); });
   next.webContents.on('will-attach-webview', event => { event.preventDefault(); });
   next.once('ready-to-show', () => { if (!qa) next.show(); });
-  next.on('closed', () => { if (window === next) { window = null; contextMenu = null; } });
+  next.on('closed', () => {
+    if (window === next) {
+      window = null; contextMenu = null;
+      if (pendingConnectionId) void providerConnections?.cancel(pendingConnectionId).catch(() => undefined);
+    }
+  });
   void next.loadFile(rendererFile).catch(error => { process.stderr.write(`Pico renderer failed: ${sanitizeDiagnostic(String(error))}\n`); });
   return next;
 }
@@ -207,13 +216,19 @@ else {
   app.on('before-quit', event => {
     if (quitting || !controller) return;
     event.preventDefault(); quitting = true;
-    void controller.shutdown().then(() => app.exit(0), error => { process.stderr.write(`${sanitizeDiagnostic(String(error))}\n`); app.exit(1); });
+    void Promise.all([controller.shutdown(), providerConnections?.shutdown()]).then(() => app.exit(0), error => { process.stderr.write(`${sanitizeDiagnostic(String(error))}\n`); app.exit(1); });
   });
   void app.whenReady().then(async () => {
     await mkdir(chromiumData, { recursive: true });
     const coordinator = new AppController(new Persistence(support), host, emit);
     controller = coordinator;
-    const actions = new DesktopActions(coordinator);
+    const connections = new ProviderConnections(
+      () => resolveExecutable(coordinator.preferences.executableOverride),
+      snapshot => { pendingConnectionId = snapshot.auth.kind === 'pending' ? snapshot.auth.id : null; emit({ kind: 'connections', snapshot }); },
+      () => coordinator.refreshProviderConnections(),
+    );
+    providerConnections = connections;
+    const actions = new DesktopActions(coordinator, connections);
     ipcMain.handle('pi:request', async (event, value: unknown): Promise<BridgeResult> => {
       if (!window || event.sender.id !== window.webContents.id || event.senderFrame?.url !== rendererUrl) return { ok: false, error: 'Untrusted application request.' };
       try {

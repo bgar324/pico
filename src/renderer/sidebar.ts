@@ -5,7 +5,7 @@ import { button, element, errorText, iconButton, Modal, request } from './dom';
 import { fuzzyScore, sortedThreads } from './helpers';
 import { SidebarMotion } from './sidebar-motion';
 import { SidebarTitles } from './sidebar-titles';
-import { icon, statusIcon } from './icons';
+import { icon } from './icons';
 
 interface ProjectView {
   node: HTMLElement; toggle: HTMLButtonElement; folder: HTMLElement; label: HTMLElement; labelViewport: HTMLElement;
@@ -154,7 +154,7 @@ export class Sidebar {
       const label = state === 'needs-input' ? 'Needs input' : state === 'background' ? 'Background' : state === 'running' ? 'Running' : 'Idle';
       view.status.dataset.state = state; view.status.title = label;
       view.status.setAttribute('aria-label', label); view.status.setAttribute('aria-hidden', String(state === 'idle'));
-      view.status.replaceChildren(...(state === 'running' || state === 'background' ? [statusIcon('running')] : []));
+      view.status.replaceChildren(...(state === 'running' || state === 'background' ? [icon('loader-circle')] : []));
     }
     for (const view of this.projects.values()) {
       view.status.hidden = !view.order.some(id => {
@@ -186,7 +186,7 @@ export class Sidebar {
     compose.append(icon('sidebar-compose')); compose.dataset.testid = 'new-thread'; compose.dataset.sidebarFocus = `project-compose-${project.id}`;
     const status = element('span', 'project-status'); status.hidden = true;
     status.setAttribute('role', 'img'); status.setAttribute('aria-label', 'Running threads'); status.title = 'Running threads';
-    status.append(statusIcon('running'));
+    status.append(icon('loader-circle'));
     const controls = element('div', 'project-actions'); controls.append(menu, compose);
     row.tabIndex = -1; row.append(toggle, status, controls); row.addEventListener('contextmenu', event => { event.preventDefault(); void this.showMenu(row, actions); });
     const empty = element('div', 'project-empty', 'No chats');

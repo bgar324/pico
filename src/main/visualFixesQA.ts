@@ -27,7 +27,7 @@ export async function runVisualFixesQA(window: BrowserWindow, controller: AppCon
     await qa.capture(`visual-fixes-${appearance}`);
     await evaluate('document.querySelector("[data-testid=settings]").click()');
     qa.check(await evaluate('Boolean(document.querySelector("dialog[open]"))')===true,'Library settings icon opens actual Settings');
-    await evaluate('document.querySelector(".modal-footer [aria-label=Cancel]").click()');
+    await evaluate(`document.querySelector('.settings-close').click()`);
   }
   await controller.updatePreferences(original);
 }

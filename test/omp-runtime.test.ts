@@ -12,16 +12,18 @@ import { Persistence } from '../src/services/Persistence';
 import { reduceRuntime } from '../src/renderer/helpers';
 import { RpcClient } from '../src/omp/RpcClient';
 import { ThreadRuntime } from '../src/omp/ThreadRuntime';
+import { QueueAttachments } from '../src/omp/QueueAttachments';
 import { MessageStore } from '../src/omp/MessageStore';
 import { dialogResponse, parseDialog } from '../src/omp/dialogs';
 import { RpcError, isRecord } from '../src/omp/frames';
-import type { ChatMessage, Json, JsonRecord, RuntimeEvent, RuntimeSnapshot, ThreadRecord, ToolActivity } from '../src/shared/types';
+import type { ChatMessage, ImageContent, Json, JsonRecord, QueuedMessage, RuntimeEvent, RuntimeSnapshot, ThreadRecord, ToolActivity } from '../src/shared/types';
+import { isBusy } from '../src/shared/types';
 
 // Test-only executable. Production launches OMP itself, never this fixture.
 // These subprocess integration tests deliberately exercise OS pipe backpressure,
 // transport deadlines and independent child clocks; fake parent timers cannot
 // drive the child's clock. Observations await state/ack barriers, not fixed sleeps.
-async function fixture(t: TestContext, options: { v1?: boolean; limit?: number; history?: 'pages' | 'stale' | 'empty' | 'repeat'; catalog?: 'empty' | 'invalid' | 'held'; catalogImages?: boolean; omitModelInput?: boolean; contextUsage?: Json; restoredContextUsage?: Json; todoPhases?: Json; restoredTodoPhases?: Json; sessionName?: string; nativeTitles?: boolean } = {}) {
+async function fixture(t: TestContext, options: { v1?: boolean; limit?: number; history?: 'pages' | 'stale' | 'empty' | 'repeat'; catalog?: 'empty' | 'invalid' | 'held'; catalogImages?: boolean; omitModelInput?: boolean; contextUsage?: Json; restoredContextUsage?: Json; todoPhases?: Json; restoredTodoPhases?: Json; sessionName?: string; nativeTitles?: boolean; nativeQueues?: boolean; editing?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'pi-electron-omp-'));
   const executable = join(root, 'fixture-omp');
   const source = `#!${process.execPath}
@@ -29,14 +31,50 @@ import { createInterface } from 'node:readline';
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 const root = ${JSON.stringify(root)};
 appendFileSync(root + '/args.log', JSON.stringify(process.argv.slice(2)) + '\\n');
+const providerModels = existsSync(root + '/provider-models.json') ? JSON.parse(readFileSync(root + '/provider-models.json', 'utf8')) : null;
 const emit = frame => {if(frame.type==='queue_update')queuedMessages={steering:frame.steering??[],followUp:frame.followUp??[]};process.stdout.write(JSON.stringify(frame) + '\\n');};
 const answer = (frame, data = {}) => emit({type:'response', id:frame.id, command:frame.type, success:true, data});
 const fail = (frame, code, error) => emit({type:'response',id:frame.id,command:frame.type,success:false,code,error});
 let model = 'text', thinkingLevel = null, forcedImages = false, levelsHeld = false, pendingLevels = null, pendingCatalog = null, pendingState = null, staleState = false;
 let settled = true, background = false, lastPrompts = [], heldPrompt = null;
+const originalEditFile = root + '/original.jsonl';
+let editFile = originalEditFile, cancelBranch = false, workDuringEntries = false;
+const editImage = {type:'image',mimeType:'image/png',data:'AAAA'};
+const editOriginal = [
+ {role:'user',content:[{type:'text',text:'Repeated prompt'}],timestamp:10},
+ {role:'assistant',content:[{type:'text',text:'First answer'}],timestamp:20},
+ {role:'user',content:[{type:'text',text:'Repeated prompt'},editImage],timestamp:30},
+ {role:'assistant',content:[{type:'text',text:'Later answer to replace'}],timestamp:40}
+];
+let editHistory = editOriginal;
 let contextUsage = ${JSON.stringify(options.contextUsage) ?? 'undefined'}, holdNextState = false, heldState = null;
 let todoPhases = ${JSON.stringify(options.todoPhases ?? [])};
 let queuedMessages = {steering:[],followUp:[]}, queuedCount = undefined;
+const queuedPayloads = {steering:[],followUp:[]};
+let heldQueue = null, holdNextQueue = false, deliverBeforePromotion = false, deliveredQueueCount = 0;
+let removalBehavior = {}, heldRemoval = null;
+const chip = entry => entry.message || (entry.images?.length ? '[Image]' : '');
+const queueUpdate = (notify=true) => {
+ const state={steering:queuedPayloads.steering.map(chip),followUp:queuedPayloads.followUp.map(chip)};
+ if(notify)emit({type:'queue_update',...state,liveSteered:0});else queuedMessages=state;
+};
+const enqueue = frame => {queuedPayloads[frame.streamingBehavior==='steer'?'steering':'followUp'].push(frame);queueUpdate();};
+const deliverQueued = (kind,notify=true) => {
+ const entry=queuedPayloads[kind].shift();if(!entry)return;
+ queueUpdate(notify);
+ emit({type:'message_end',messageId:'delivered-queue-'+(++deliveredQueueCount),message:{role:'user',content:[{type:'text',text:entry.message},...(entry.images??[])]}});
+};
+const removeQueued = f => {
+ if(removalBehavior.deliverBefore){removalBehavior.deliverBefore=false;deliverQueued(f.queue);}
+ let index=queuedPayloads[f.queue].findIndex(entry=>entry.message===f.message);
+ if(index<0)index=queuedPayloads[f.queue].findIndex(entry=>chip(entry)===f.message);
+ let data={removed:false};
+ if(index>=0){
+  const entry=queuedPayloads[f.queue].splice(index,1)[0];queueUpdate(removalBehavior.notify!==false);
+  data=removalBehavior.result??{removed:true,...(removalBehavior.dropImages?{imagesDropped:true}:removalBehavior.omitImages?{}:(removalBehavior.images??entry.images)?.length?{images:removalBehavior.images??entry.images}:{})};
+ }
+ if(removalBehavior.holdResponse){removalBehavior.holdResponse=false;heldRemoval={frame:f,data};}else answer(f,data);
+};
 const sessionId = process.argv[process.argv.indexOf('--session-dir') + 1] ?? root;
 const titlePath = sessionId + '/fixture-title.json';
 let sessionTitle = existsSync(titlePath) ? JSON.parse(readFileSync(titlePath, 'utf8')) : {name:${JSON.stringify(options.sessionName) ?? 'undefined'},source:'auto'};
@@ -44,7 +82,7 @@ let holdName = false, rejectName = false, pendingName = null;
 let pendingGeneratedTitle = false;
 const saveTitle = (name, source) => {sessionTitle={name,source};writeFileSync(titlePath,JSON.stringify(sessionTitle));};
 const rename = f => {if(rejectName)fail(f,'rename_denied','Session rename denied');else{saveTitle(f.name,'user');answer(f);}};
-const state = () => ({model:{provider:'fixture',id:model,name:model,input:${options.omitModelInput ? 'undefined' : "model==='image'||forcedImages?['text','image']:['text']"}},thinkingLevel:thinkingLevel==='inherit'?undefined:thinkingLevel??(model==='image'?'high':'off'),isSettled:settled,isStreaming:!settled&&!background,hasPendingAsyncWork:background,queuedMessages,queuedMessageCount:queuedCount??queuedMessages.steering.length+queuedMessages.followUp.length,contextUsage,todoPhases,sessionId,sessionName:sessionTitle.name});
+const state = () => ({model:{provider:'fixture',id:model,name:model,input:${options.omitModelInput ? 'undefined' : "model==='image'||forcedImages?['text','image']:['text']"}},thinkingLevel:thinkingLevel==='inherit'?undefined:thinkingLevel??(model==='image'?'high':'off'),isSettled:settled,isStreaming:!settled&&!background,hasPendingAsyncWork:background,queuedMessages,queuedMessageCount:queuedCount??queuedMessages.steering.length+queuedMessages.followUp.length,contextUsage,todoPhases,sessionId,sessionFile:editFile,sessionName:sessionTitle.name});
 const rl = createInterface({input:process.stdin, crlfDelay:Infinity});
 emit({type:'ready',protocolVersion:1,supportedProtocolVersions:${options.v1 ? '[1]' : '[1,2]'},maxFrameBytes:${options.limit ?? 1048576},maxReassembledFrameBytes:67108864});
 rl.on('line', line => {
@@ -54,7 +92,7 @@ rl.on('line', line => {
  case 'first': pendingState = f; break;
  case 'second': answer(f,{value:'second'}); if(pendingState){answer(pendingState,{value:'first'});pendingState=null;} break;
  case 'never': break;
- case 'fixture_status': answer(f,{levelsPending:!!pendingLevels,statePending:!!heldState,catalogPending:!!pendingCatalog,namePending:!!pendingName,generatedTitlePending:pendingGeneratedTitle,model});break;
+ case 'fixture_status': answer(f,{levelsPending:!!pendingLevels,statePending:!!heldState,catalogPending:!!pendingCatalog,namePending:!!pendingName,generatedTitlePending:pendingGeneratedTitle,removalPending:!!heldRemoval,model});break;
  case 'malformed': process.stdout.write('{broken JSON\\n'); break;
  case 'mismatch': emit({type:'response',id:f.id,command:'wrong',success:true,data:{}}); break;
  case 'fail': fail(f,'permission_denied','api_key=secret Denied'); break;
@@ -62,7 +100,7 @@ rl.on('line', line => {
    if(${JSON.stringify(options.catalog)} === 'held') pendingCatalog=f;
    else if(${JSON.stringify(options.catalog)} === 'invalid') answer(f,{models:null});
    else if(${JSON.stringify(options.catalog)} === 'empty') answer(f,{models:[]});
-   else answer(f,{models:[{provider:'fixture',id:'text',name:'Text',input:${options.catalogImages ? "['text','image']" : "['text']"}}]});
+   else answer(f,{models:providerModels??[{provider:'fixture',id:'text',name:'Text',input:${options.catalogImages ? "['text','image']" : "['text']"}}]});
    break;
  case 'release_catalog':
    answer(f);
@@ -79,6 +117,7 @@ rl.on('line', line => {
  case 'get_subagents': answer(f,{subagents:[]}); break;
  case 'get_available_commands': answer(f,{commands:${options.nativeTitles ? "[{name:'rename',source:'builtin'}]" : '[]'}});break;
  case 'get_messages_page':
+   if(${options.editing === true}) {answer(f,{messages:editHistory,totalMessages:editHistory.length});break;}
    ${options.restoredContextUsage === undefined ? '' : `contextUsage = ${JSON.stringify(options.restoredContextUsage)};`}
    ${options.restoredTodoPhases === undefined ? '' : `todoPhases = ${JSON.stringify(options.restoredTodoPhases)};`}
    if(${JSON.stringify(options.history ?? 'empty')} === 'empty') answer(f,{messages:[],totalMessages:0});
@@ -88,6 +127,18 @@ rl.on('line', line => {
    else answer(f,{messages:[{role:'user',content:'Original prompt'},{role:'assistant',content:'Original answer'}],totalMessages:4,nextCursor:'cursor'});
    break;
  case 'get_messages': answer(f,{messages:[{role:'user',content:'Authoritative fallback'}]}); break;
+ case 'get_entries':
+   if(workDuringEntries){workDuringEntries=false;settled=false;emit({type:'agent_start'});}
+   answer(f,{entries:editHistory.map((message,index)=>({type:'message',id:'native-'+index,parentId:index?'native-'+(index-1):null,message})),leafId:'native-'+(editHistory.length-1)});break;
+ case 'edit_behavior': cancelBranch=f.cancel===true;workDuringEntries=f.startWork===true;answer(f);break;
+ case 'branch': {
+   if(cancelBranch){answer(f,{cancelled:true,text:''});break;}
+   const index=editHistory.findIndex((_,index)=>'native-'+index===f.entryId);
+   if(index<0){fail(f,'invalid_entry','Missing entry');break;}
+   editHistory=editHistory.slice(0,index);editFile=root+'/edited.jsonl';
+   answer(f,{cancelled:false,text:'Repeated prompt'});break;
+ }
+ case 'switch_session': editFile=f.sessionPath;if(editFile===originalEditFile)editHistory=editOriginal;answer(f,{cancelled:false});break;
  case 'hold_model': model='image';levelsHeld=true;emit({type:'model_changed'});answer(f);break;
  case 'switch_model': model=f.model; forcedImages=false;levelsHeld=false;emit({type:'model_changed'});answer(f);break;
  case 'switch_capabilities': model='text';forcedImages=true;emit({type:'model_changed'});answer(f);break;
@@ -113,9 +164,21 @@ rl.on('line', line => {
    if(pendingGeneratedTitle){pendingGeneratedTitle=false;if(f.error)emit({type:'command_output',text:'Rename failed: title provider unavailable'});else if(sessionTitle.source!=='user'){saveTitle(f.title??'Native generated title','user');emit({type:'session_info_update',sessionId,title:sessionTitle.name});emit({type:'command_output',text:'Session renamed to '+sessionTitle.name+'.'});}}
    answer(f);break;
  case 'prompt': case 'abort_and_prompt':
+   if(${options.editing === true}) {
+     if(f.message==='reject-edit'){fail(f,'denied','Input hook rejected this edit');break;}
+     const user={role:'user',content:[{type:'text',text:f.message},...(f.images??[])],timestamp:50};
+     const reply={role:'assistant',content:[{type:'text',text:'Response to edited turn'}],timestamp:60};
+     editHistory=[...editHistory,user,reply];
+     emit({type:'message_end',messageId:'edited-user',message:user});
+     answer(f,{agentInvoked:true});
+     emit({type:'message_end',messageId:'edited-answer',message:reply});
+     emit({type:'prompt_result',id:f.id,status:'completed',sessionSettled:true});
+     break;
+   }
    if(f.message==='/rename'){pendingGeneratedTitle=true;answer(f,{agentInvoked:false});break;}
    lastPrompts.push(f); if(f.message==='held'){heldPrompt=f;settled=false;break;}
    if(f.message==='local'){answer(f,{agentInvoked:false});break;}
+   if(${options.nativeQueues === true} && f.streamingBehavior){if(holdNextQueue){holdNextQueue=false;heldQueue=f;}else{enqueue(f);answer(f);}break;}
    settled=false;answer(f,{agentInvoked:true}); break;
  case 'release_prompt':
    if(heldPrompt){settled=true;if(f.failed)fail(heldPrompt,'denied','Local hook denied');else answer(heldPrompt,{agentInvoked:false});heldPrompt=null;}
@@ -123,6 +186,30 @@ rl.on('line', line => {
  case 'complete_prompt':
    settled=f.settled;emit({type:'prompt_result',id:lastPrompts[f.index??0]?.id,status:f.status??'completed',sessionSettled:f.settled});answer(f);break;
  case 'settle': settled=true;background=false;emit({type:'session_settled'});answer(f);break;
+ case 'finish_native_turn':
+   settled=true;background=false;emit({type:'agent_end',yielded:true});
+   for(const prompt of lastPrompts)emit({type:'prompt_result',id:prompt.id,status:'completed',sessionSettled:!queuedPayloads.steering.length&&!queuedPayloads.followUp.length});
+   emit({type:'session_settled'});answer(f);break;
+ case 'hold_next_queue_admission': holdNextQueue=true;answer(f);break;
+ case 'release_queued_admission':
+   if(heldQueue){const entry=heldQueue;heldQueue=null;if(f.failed)fail(entry,'denied','Queued input denied');else if(f.local)answer(entry,{agentInvoked:false});else{enqueue(entry);answer(entry);}}
+   answer(f);break;
+ case 'promote_after_delivery': deliverBeforePromotion=true;answer(f);break;
+ case 'promote_queued_message': {
+   if(deliverBeforePromotion){deliverBeforePromotion=false;deliverQueued('followUp');}
+   let index=queuedPayloads.followUp.findIndex(entry=>entry.message===f.message);
+   if(index<0)index=queuedPayloads.followUp.findIndex(entry=>chip(entry)===f.message);
+   if(index<0)answer(f,{promoted:false});else{queuedPayloads.steering.push(queuedPayloads.followUp.splice(index,1)[0]);queueUpdate();answer(f,{promoted:true});}
+   break;
+ }
+ case 'queue_removal_behavior': removalBehavior=f;answer(f);break;
+ case 'remove_queued_message':
+   if(removalBehavior.hold){removalBehavior.hold=false;heldRemoval={frame:f};}else removeQueued(f);break;
+ case 'release_queue_removal':
+   if(heldRemoval){const pending=heldRemoval;heldRemoval=null;if(pending.data)answer(pending.frame,pending.data);else removeQueued(pending.frame);}answer(f);break;
+ case 'clear_queued':
+   if(f.queue)queuedPayloads[f.queue]=[];else{queuedPayloads.steering=[];queuedPayloads.followUp=[];}queueUpdate();answer(f);break;
+ case 'deliver_queued': deliverQueued(f.queue??'followUp',f.notify!==false);answer(f);break;
  case 'abort': answer(f);break;
  case 'dialog': emit({type:'extension_ui_request',...f.frame});answer(f);break;
  case 'pause_input': answer(f);rl.pause();if(f.cancel)setTimeout(()=>emit({type:'extension_ui_request',method:'cancel',targetId:f.cancel}),100);setTimeout(()=>rl.resume(),400);break;
@@ -184,8 +271,17 @@ async function heldGeneratedTitle(client: RpcClient): Promise<void> {
   }
 }
 
-async function applicationFixture(t: TestContext, history: 'pages' | 'empty' = 'pages', options: { selected?: boolean; bootstrap?: boolean; catalog?: 'invalid' | 'held'; sessionName?: string; nativeTitles?: boolean } = {}) {
-  const f = await fixture(t, { history, nativeTitles: options.nativeTitles ?? false, ...(options.catalog ? { catalog: options.catalog } : {}), ...(options.sessionName ? { sessionName: options.sessionName } : {}) });
+async function heldQueueRemoval(client: RpcClient): Promise<void> {
+  const deadline = Date.now() + 3000;
+  for (;;) {
+    const status = await client.request('fixture_status');
+    if (isRecord(status) && status.removalPending === true) return;
+    assert.ok(Date.now() < deadline, 'Retraction did not reach the held native command');
+  }
+}
+
+async function applicationFixture(t: TestContext, history: 'pages' | 'empty' = 'pages', options: { selected?: boolean; bootstrap?: boolean; catalog?: 'invalid' | 'held'; sessionName?: string; nativeTitles?: boolean; editing?: boolean } = {}) {
+  const f = await fixture(t, { history, nativeTitles: options.nativeTitles ?? false, ...(options.catalog ? { catalog: options.catalog } : {}), ...(options.sessionName ? { sessionName: options.sessionName } : {}), ...(options.editing ? { editing: true } : {}) });
   const persistence = new Persistence(join(f.root, 'Storage'));
   const threads = Array.from({ length: 4 }, (_, index): ThreadRecord => {
     const id = randomUUID().toUpperCase();
@@ -618,7 +714,7 @@ test('two clients isolate sessions and IDs; reconnect keeps event subscription a
   assert.doesNotMatch(a.runtime.client.diagnostics(), /abcdef0123456789/);
   await a.runtime.shutdown(); await a.runtime.connect(a.executable);
   await a.runtime.client.request('emit_event', { frame: { type: 'queue_update', steering: ['live'], followUp: [] } });
-  assert.deepEqual(a.runtime.summary().queuedSteers, ['live']);
+  assert.deepEqual(a.runtime.summary().queuedSteers.map(entry => entry.text), ['live']);
 });
 
 for (const history of ['pages', 'stale', 'repeat', 'empty'] as const) test(`history ${history} is restored without replay or duplicate pages`, async t => {
@@ -865,7 +961,7 @@ for (const command of ['prompt', 'abort_and_prompt']) for (const failed of [fals
 test('stale state reply cannot reverse newer settled and queue events', async t => {
   const f = await fixture(t, { history: 'empty' }); const r = f.runtime; await r.connect(f.executable);
   r.consume({ type: 'agent_start' }); await r.client.request('stale_next_state'); await r.stop();
-  assert.deepEqual(r.summary().status, { kind: 'ready', activity: 'idle' }); assert.deepEqual(r.summary().queuedSteers, []); assert.deepEqual(r.summary().queuedFollowUps, ['new queue']);
+  assert.deepEqual(r.summary().status, { kind: 'ready', activity: 'idle' }); assert.deepEqual(r.summary().queuedSteers, []); assert.deepEqual(r.summary().queuedFollowUps.map(entry => entry.text), ['new queue']);
 });
 
 test('inherit resets thinking outside discovery while unknown levels leave engine state unchanged', async t => {
@@ -900,7 +996,7 @@ for (const event of ['agent_start', 'session_settled', 'thinking_level_changed']
   assert.deepEqual(r.summary().thinkingLevels, ['off', 'high']); assert.equal(r.summary().thinkingLevel, event === 'thinking_level_changed' ? 'off' : 'high');
   assert.equal(r.summary().models.find(model => model.id === 'fixture/image')?.supportsImages, true);
   assert.deepEqual(r.summary().status, { kind: 'ready', activity: event === 'agent_start' ? 'running' : 'idle' });
-  assert.deepEqual(r.summary().queuedFollowUps, ['newer queue']);
+  assert.deepEqual(r.summary().queuedFollowUps.map(entry => entry.text), ['newer queue']);
 });
 
 test('new model event cancels old refresh and shutdown prevents stale configuration applying on reconnect', async t => {
@@ -968,7 +1064,7 @@ test('live context refresh coalesces overlapping boundaries and never polls toke
   await waitUntil(() => f.cache.get(f.record.id)?.contextUsage?.tokens === 1200);
   assert.equal((await commands(f.root)).filter(frame => frame.type === 'get_state').length - before, 2);
   assert.deepEqual(r.summary().status, { kind: 'ready', activity: 'idle' });
-  assert.deepEqual(r.summary().queuedFollowUps, ['keep this queue']);
+  assert.deepEqual(r.summary().queuedFollowUps.map(entry => entry.text), ['keep this queue']);
   assert.equal(r.summary().thinkingLevel, 'high');
   for (const [type, tokens] of [['agent_end', 1500], ['auto_compaction_end', 700], ['turn_end', 900]] as const) {
     await r.client.request('set_context_usage', { value: { tokens, contextWindow: 922000 }, events: [{ type }] });
@@ -1002,7 +1098,7 @@ test('a model switch rejects held usage from the previous model without reversin
   assert.deepEqual(r.summary().contextUsage, { tokens: 4000000, contextWindow: 200000 });
   assert.equal(f.events.slice(boundary).some(event => (event.kind === 'summary' || event.kind === 'snapshot') && event.runtime.contextUsage?.tokens === 8000), false);
   assert.deepEqual(r.summary().status, { kind: 'ready', activity: 'running' });
-  assert.deepEqual(r.summary().queuedSteers, ['new steer']);
+  assert.deepEqual(r.summary().queuedSteers.map(entry => entry.text), ['new steer']);
   assert.equal(r.summary().thinkingLevel, 'off');
 });
 
@@ -1134,8 +1230,8 @@ test('runtime deltas emit one message event, no full histories, summaries and sn
   r.consume({ type: 'message_update', messageId: 'one', assistantMessageEvent: { type: 'text_delta', delta: 'hello' } });
   assert.equal(f.events.length, 1); assert.equal(f.events[0]?.kind, 'message');
   const snapshot = r.snapshot(); if (snapshot.messages[0]) snapshot.messages[0].text = 'corrupt';
-  r.consume({ type: 'queue_update', steering: ['one'], followUp: ['two'] }); const summary = r.summary(); summary.queuedSteers.push('corrupt'); if (summary.models[0]) summary.models[0].name = 'corrupt';
-  assert.equal(r.snapshot().messages[0]?.text, 'hello'); assert.deepEqual(r.summary().queuedSteers, ['one']);
+  r.consume({ type: 'queue_update', steering: ['one'], followUp: ['two'] }); const summary = r.summary(); summary.queuedSteers.push({ text: 'corrupt', imageCount: 0, imageRef: null }); if (summary.models[0]) summary.models[0].name = 'corrupt';
+  assert.equal(r.snapshot().messages[0]?.text, 'hello'); assert.deepEqual(r.summary().queuedSteers.map(entry => entry.text), ['one']);
   assert.ok(f.events.every(event => event.kind !== 'snapshot'));
   const revisions = f.events.map(event => event.kind === 'summary' ? event.runtime.revision : event.revision);
   assert.ok(revisions.every((revision, index) => index === 0 || revision > (revisions[index - 1] ?? 0)));
@@ -1175,7 +1271,7 @@ test('a background prompt yield remains busy until session_settled; queues repla
   assert.deepEqual(r.summary().status, { kind: 'ready', activity: 'background' });
   r.consume({ type: 'queue_update', steering: ['old'], followUp: ['next'] });
   r.consume({ type: 'queue_update', steering: [], followUp: ['replacement'] });
-  assert.deepEqual(r.summary().queuedSteers, []); assert.deepEqual(r.summary().queuedFollowUps, ['replacement']);
+  assert.deepEqual(r.summary().queuedSteers, []); assert.deepEqual(r.summary().queuedFollowUps.map(entry => entry.text), ['replacement']);
   await r.client.request('settle'); assert.deepEqual(r.summary().status, { kind: 'ready', activity: 'idle' });
 });
 
@@ -1185,7 +1281,7 @@ test('canonical queues clear a delivered image steer without a queue_update noti
   const image = { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=' };
   await r.sendPrompt('Working turn');
   await r.client.request('set_queue_state', { steering: [message], events: [{ type: 'queue_update', steering: [message], followUp: [] }] });
-  assert.deepEqual(f.cache.get(f.record.id)?.queuedSteers, [message]);
+  assert.deepEqual(f.cache.get(f.record.id)?.queuedSteers.map(entry => entry.text), [message]);
   await r.client.request('set_queue_state', { steering: [], events: [{ type: 'message_end', messageId: 'delivered-steer', message: { role: 'user', steering: true, content: [{ type: 'text', text: message }, image] } }] });
   await waitUntil(() => f.cache.get(f.record.id)?.queuedSteers.length === 0);
   const delivered = f.cache.get(f.record.id)?.messages.find(item => item.id === 'delivered-steer');
@@ -1199,7 +1295,7 @@ test('a pre-delivery state read cannot resurrect a delivered queued steer', asyn
   await r.client.request('hold_next_state');
   await r.client.request('emit_event', { frame: { type: 'turn_end' } }); await heldUsageState(r.client);
   await r.client.request('set_queue_state', { steering: [], events: [{ type: 'message_end', messageId: 'delivered', message: { role: 'user', content: 'queued' } }] });
-  assert.deepEqual(r.summary().queuedSteers, ['queued']);
+  assert.deepEqual(r.summary().queuedSteers.map(entry => entry.text), ['queued']);
   await r.client.request('release_state');
   await waitUntil(() => f.cache.get(f.record.id)?.queuedSteers.length === 0);
   assert.equal(f.cache.get(f.record.id)?.messages.find(item => item.id === 'delivered')?.text, 'queued');
@@ -1214,8 +1310,8 @@ test('newer queue events outrank held boundary reads while fresh queued state is
   const boundary = f.events.length;
   await r.client.request('release_state');
   await waitUntil(() => f.cache.get(f.record.id)?.contextUsage?.tokens === 1800);
-  assert.deepEqual(f.cache.get(f.record.id)?.queuedSteers, ['new intent']);
-  for (const event of f.events.slice(boundary)) if (event.kind === 'summary') assert.deepEqual(event.runtime.queuedSteers, ['new intent']);
+  assert.deepEqual(f.cache.get(f.record.id)?.queuedSteers.map(entry => entry.text), ['new intent']);
+  for (const event of f.events.slice(boundary)) if (event.kind === 'summary') assert.deepEqual(event.runtime.queuedSteers.map(entry => entry.text), ['new intent']);
 });
 
 test('native live-steer and identical pending messages are not deduplicated against history', async t => {
@@ -1224,10 +1320,10 @@ test('native live-steer and identical pending messages are not deduplicated agai
   await waitUntil(() => f.cache.get(f.record.id)?.queuedSteers.length === 2);
   await r.client.request('set_queue_state', { steering: ['same'], count: 0, events: [{ type: 'message_end', messageId: 'one-delivered', message: { role: 'user', content: 'same' } }] });
   await waitUntil(() => f.cache.get(f.record.id)?.queuedSteers.length === 1);
-  assert.deepEqual(r.summary().queuedSteers, ['same']);
+  assert.deepEqual(r.summary().queuedSteers.map(entry => entry.text), ['same']);
   await r.client.request('set_queue_state', { steering: ['same', 'same'], events: [{ type: 'turn_end' }] });
   await waitUntil(() => f.cache.get(f.record.id)?.queuedSteers.length === 2);
-  assert.deepEqual(r.summary().queuedSteers, ['same', 'same']);
+  assert.deepEqual(r.summary().queuedSteers.map(entry => entry.text), ['same', 'same']);
   assert.equal(r.snapshot().messages.filter(message => message.role === 'user').length, 1);
 });
 
@@ -1437,4 +1533,618 @@ test('successful todo RPC responses update the live cache before returning and c
   assert.deepEqual(f.cache.get(f.record.id)?.todoPhases, phases);
   await r.client.request('set_todos', { phases: [] });
   assert.deepEqual(f.cache.get(f.record.id)?.todoPhases, []);
+});
+
+test('account changes refresh idle catalogs without selecting chats, losing drafts, or replaying turns', async t => {
+  const f = await applicationFixture(t, 'pages', { selected: true });
+  try {
+    const [first, second] = f.threads;
+    assert.ok(first && second);
+    f.app.setDraft(first.id, 'Keep this unfinished draft');
+    await f.app.selectThread(second.id);
+    const before = f.cache.get(first.id);
+    assert.ok(before);
+    await writeFile(join(f.root, 'provider-models.json'), JSON.stringify([{ provider: 'connected', id: 'new-account-model', name: 'New account model', input: ['text'] }]));
+    await f.app.refreshProviderConnections();
+    assert.equal(f.app.manifest.selectedThreadID, second.id);
+    assert.equal(f.app.manifest.threads.find(thread => thread.id === first.id)?.draft, 'Keep this unfinished draft');
+    for (const thread of [first, second]) {
+      const restored = f.cache.get(thread.id);
+      assert.ok(restored);
+      assert.ok(restored.models.some(model => model.id === 'connected/new-account-model'));
+      assert.equal(restored.status.kind, 'ready');
+      assert.deepEqual(restored.messages.filter(message => message.role === 'user').map(message => message.text), ['Original prompt']);
+    }
+    assert.ok((f.cache.get(first.id)?.revision ?? 0) > before.revision);
+    assert.equal((await commands(f.root)).some(frame => ['prompt', 'abort', 'abort_and_prompt', 'restore'].includes(String(frame.type))), false);
+  } finally { await f.app.shutdown(); }
+});
+
+test('account changes leave background work running and adopt new catalogs only after native settlement', async t => {
+  const f = await applicationFixture(t, 'pages', { selected: true });
+  try {
+    const first = f.threads[0];
+    assert.ok(first);
+    const runtime = await f.app.runtimeFor(first.id);
+    f.app.setDraft(first.id, 'Do not clear this draft');
+    await runtime.client.request('set_work_state', { settled: false, background: true });
+    await runtime.client.request('emit_event', { frame: { type: 'agent_start' } });
+    await runtime.refreshState();
+    const work = runtime.summary().workPeriods?.[0];
+    assert.ok(work);
+    await writeFile(join(f.root, 'provider-models.json'), JSON.stringify([{ provider: 'connected', id: 'later-model', name: 'Later model', input: ['text'] }]));
+    await f.app.refreshProviderConnections();
+    assert.deepEqual(runtime.summary().status, { kind: 'ready', activity: 'background' });
+    assert.equal(runtime.summary().models.some(model => model.provider === 'connected'), false);
+    assert.equal(runtime.client.ready, true);
+    await runtime.client.request('settle');
+    await waitUntil(() => f.cache.get(first.id)?.models.some(model => model.id === 'connected/later-model') === true);
+    const restored = f.cache.get(first.id);
+    assert.deepEqual(restored?.status, { kind: 'ready', activity: 'idle' });
+    assert.equal(restored?.workPeriods?.[0]?.startedAt, work.startedAt);
+    assert.equal(typeof restored?.workPeriods?.[0]?.endedAt, 'number');
+    assert.equal(f.app.manifest.selectedThreadID, first.id);
+    assert.equal(f.app.manifest.threads.find(thread => thread.id === first.id)?.draft, 'Do not clear this draft');
+    assert.equal((await commands(f.root)).some(frame => ['prompt', 'abort', 'abort_and_prompt'].includes(String(frame.type))), false);
+  } finally { await f.app.shutdown(); }
+});
+
+function queueContents(entries: readonly QueuedMessage[]): { text: string; imageCount: number }[] {
+  for (const entry of entries) {
+    if (entry.imageCount > 0) assert.ok(entry.imageRef);
+    else assert.equal(entry.imageRef, null);
+  }
+  return entries.map(({ text, imageCount }) => ({ text, imageCount }));
+}
+
+function queuedImageRef(entry: QueuedMessage | undefined): string {
+  assert.ok(entry?.imageRef);
+  return entry.imageRef;
+}
+
+test('queued image lookup exposes only active canonical occurrences with their distinct images', () => {
+  const queues = new QueueAttachments();
+  const first: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  const second: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AQ==' };
+  const firstImages = [first], secondImages = [second];
+  queues.submitted('first', 'followUp', 'same', firstImages);
+  queues.submitted('second', 'followUp', 'same', secondImages);
+  assert.throws(() => queues.getImages('first'), /Queued image preview has expired\./);
+  const snapshot = queues.reconcile([], ['same', 'same']);
+  assert.notEqual(snapshot.followUp[0]?.imageRef, snapshot.followUp[1]?.imageRef);
+  assert.deepEqual(queues.getImages(queuedImageRef(snapshot.followUp[0])), firstImages);
+  assert.deepEqual(queues.getImages(queuedImageRef(snapshot.followUp[1])), secondImages);
+  queues.reconcile([], ['same']);
+  assert.throws(() => queues.getImages('first'), /Queued image preview has expired\./);
+  assert.deepEqual(queues.getImages('second'), secondImages);
+  const promotion = queues.promote('same');
+  const promoted = queues.reconcile(['same'], []);
+  queues.finishPromotion(promotion);
+  assert.equal(promoted.steering[0]?.imageRef, snapshot.followUp[1]?.imageRef);
+  assert.deepEqual(queues.getImages('second'), secondImages);
+});
+
+test('promotion keeps the promoted picture when earlier same-text steers were consumed without a queue update', () => {
+  const queues = new QueueAttachments();
+  const consumed: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  const retained: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AQ==' };
+  const promoted: ImageContent = { type: 'image', mimeType: 'image/png', data: 'Ag==' };
+  queues.submitted('consumed', 'steering', 'same', [consumed]);
+  queues.submitted('retained', 'steering', 'same', [retained]);
+  queues.submitted('promoted', 'followUp', 'same', [promoted]);
+  const before = queues.reconcile(['same', 'same'], ['same']);
+  const promotion = queues.promote('same');
+  const after = queues.reconcile(['same', 'same'], []);
+  queues.finishPromotion(promotion);
+  assert.deepEqual(after.steering.map(entry => entry.imageRef), [before.steering[1]?.imageRef, before.followUp[0]?.imageRef]);
+  assert.deepEqual(queues.getImages(queuedImageRef(after.steering[0])), [retained]);
+  assert.deepEqual(queues.getImages(queuedImageRef(after.steering[1])), [promoted]);
+  assert.throws(() => queues.getImages(queuedImageRef(before.steering[0])), /expired/);
+});
+
+for (const ending of ['clear', 'reject', 'reset', 'lost-continuity'] as const) test(`queued image ${ending} releases its reference without reassociating equal text`, () => {
+  const queues = new QueueAttachments();
+  const images: ImageContent[] = [{ type: 'image', mimeType: 'image/png', data: 'AA==' }];
+  queues.submitted('old', 'followUp', 'same', images);
+  queues.reconcile([], ['same']);
+  if (ending === 'clear') queues.reconcile([], []);
+  else if (ending === 'reject') queues.rejected('old');
+  else if (ending === 'reset') queues.reset();
+  else {
+    queues.submitted('replacement', 'followUp', 'same', []);
+    queues.admitted('replacement', 1);
+    queues.reconcile([], ['same'], 1);
+  }
+  assert.throws(() => queues.getImages('old'), /Queued image preview has expired\./);
+  const snapshot = queues.reconcile([], ['same']);
+  assert.deepEqual(snapshot.followUp, [{ text: 'same', imageCount: 0, imageRef: null }]);
+  queues.submitted('new', 'followUp', 'same', images);
+  const appended = queues.reconcile([], ['same', 'same']);
+  assert.equal(appended.followUp[0]?.imageRef, null);
+  assert.equal(appended.followUp[1]?.imageRef, 'new');
+  assert.deepEqual(queues.getImages('new'), images);
+  assert.throws(() => queues.getImages('old'), /Queued image preview has expired\./);
+});
+
+test('same-count FIFO consumption publishes the surviving image reference to runtime summaries', async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  const first = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  const second = { type: 'image', mimeType: 'image/png', data: 'AQ==' };
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('same', { images: [first] });
+  await r.sendPrompt('same', { images: [second] });
+  const firstRef = queuedImageRef(r.summary().queuedFollowUps[0]);
+  const secondRef = queuedImageRef(r.summary().queuedFollowUps[1]);
+  assert.notEqual(firstRef, secondRef);
+  assert.deepEqual(r.getQueuedImages(firstRef)[0], first);
+  assert.deepEqual(r.getQueuedImages(secondRef)[0], second);
+  await r.client.request('deliver_queued');
+  assert.deepEqual(queueContents(r.summary().queuedFollowUps), [{ text: 'same', imageCount: 1 }]);
+  assert.equal(r.summary().queuedFollowUps[0]?.imageRef, secondRef);
+  assert.equal(f.cache.get(f.record.id)?.queuedFollowUps[0]?.imageRef, secondRef);
+  assert.deepEqual(r.getQueuedImages(secondRef)[0], second);
+  assert.throws(() => r.getQueuedImages(firstRef), /Queued image preview has expired\./);
+  await r.client.request('set_queue_state', { followUp: [], events: [{ type: 'queue_update', steering: [], followUp: [] }] });
+  assert.throws(() => r.getQueuedImages(secondRef), /Queued image preview has expired\./);
+});
+
+test('admitted images that never bind cannot attach to a later equal-text canonical entry', () => {
+  const queues = new QueueAttachments();
+  queues.submitted('missing', 'followUp', 'same', [{ type: 'image', mimeType: 'image/png', data: 'AA==' }]);
+  queues.admitted('missing', 1);
+  queues.reconcile([], [], 1);
+  assert.throws(() => queues.getImages('missing'), /Queued image preview has expired\./);
+  assert.deepEqual(queues.reconcile([], ['same']).followUp, [{ text: 'same', imageCount: 0, imageRef: null }]);
+});
+
+test('queued follow-ups and steers retain submitted image counts, including image-only Send now and canonical delivery', async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  const image = { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=' };
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('Review these', { images: [image, image] });
+  await r.sendPrompt('', { images: [image] });
+  await r.sendPrompt('Steer with image', { steer: true, images: [image] });
+  assert.deepEqual(queueContents(r.summary().queuedFollowUps), [{ text: 'Review these', imageCount: 2 }, { text: '', imageCount: 1 }]);
+  assert.deepEqual(queueContents(r.summary().queuedSteers), [{ text: 'Steer with image', imageCount: 1 }]);
+  const imageOnlyRef = queuedImageRef(r.summary().queuedFollowUps[1]);
+  assert.deepEqual(r.getQueuedImages(imageOnlyRef)[0], image);
+  assert.equal(JSON.stringify(r.summary()).includes(image.data), false);
+  assert.equal(await r.promoteQueued(''), true);
+  assert.deepEqual(queueContents(r.summary().queuedFollowUps), [{ text: 'Review these', imageCount: 2 }]);
+  assert.deepEqual(queueContents(r.summary().queuedSteers), [{ text: 'Steer with image', imageCount: 1 }, { text: '', imageCount: 1 }]);
+  assert.equal(r.summary().queuedSteers[1]?.imageRef, imageOnlyRef);
+  assert.deepEqual(r.getQueuedImages(imageOnlyRef)[0], image);
+  await r.client.request('deliver_queued', { queue: 'followUp', notify: false });
+  await waitUntil(() => r.summary().queuedFollowUps.length === 0);
+  assert.deepEqual(r.snapshot().messages.find(message => message.id === 'delivered-queue-1')?.images, [image, image]);
+  await r.client.request('deliver_queued', { queue: 'steering' });
+  assert.deepEqual(queueContents(r.summary().queuedSteers), [{ text: '', imageCount: 1 }]);
+  await r.client.request('deliver_queued', { queue: 'steering' });
+  await waitUntil(() => r.summary().queuedSteers.length === 0);
+  assert.throws(() => r.getQueuedImages(imageOnlyRef), /Queued image preview has expired\./);
+});
+
+test('equal-text promotion follows the surviving occurrence after the first image message delivers', async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  const image = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  const secondImage = { type: 'image', mimeType: 'image/png', data: 'AQ==' };
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('same', { images: [image] });
+  await r.sendPrompt('same', { images: [secondImage, secondImage] });
+  const firstRef = queuedImageRef(r.summary().queuedFollowUps[0]);
+  const secondRef = queuedImageRef(r.summary().queuedFollowUps[1]);
+  assert.notEqual(firstRef, secondRef);
+  assert.deepEqual(r.getQueuedImages(firstRef)[0], image);
+  assert.deepEqual(r.getQueuedImages(secondRef)[0], secondImage);
+  assert.deepEqual(r.summary().queuedFollowUps.map(entry => entry.imageCount), [1, 2]);
+  await r.client.request('promote_after_delivery');
+  assert.equal(await r.promoteQueued('same'), true);
+  assert.deepEqual(r.summary().queuedFollowUps, []);
+  assert.deepEqual(queueContents(r.summary().queuedSteers), [{ text: 'same', imageCount: 2 }]);
+  assert.equal(r.summary().queuedSteers[0]?.imageRef, secondRef);
+  assert.deepEqual(r.getQueuedImages(secondRef)[0], secondImage);
+  assert.throws(() => r.getQueuedImages(firstRef), /Queued image preview has expired\./);
+  await r.client.request('deliver_queued', { queue: 'steering' });
+  assert.throws(() => r.getQueuedImages(secondRef), /Queued image preview has expired\./);
+  await r.sendPrompt('same');
+  assert.deepEqual(queueContents(r.summary().queuedFollowUps), [{ text: 'same', imageCount: 0 }]);
+});
+
+for (const outcome of ['failed', 'local', 'admitted'] as const) test(`late queued ${outcome} response cannot misattribute images to later equal text`, async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  const image = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  await r.sendPrompt('Working turn');
+  const request = r.client.request.bind(r.client);
+  r.client.request = (type, fields = {}, options = {}) => request(type, fields, type === 'prompt' ? { ...options, timeout: 20 } : options);
+  await r.client.request('hold_next_queue_admission');
+  assert.equal(await r.sendPrompt('same', { images: [image, image] }), false);
+  const heldID = (await commands(f.root)).filter(frame => frame.type === 'prompt').at(-1)?.id;
+  assert.equal(typeof heldID, 'string');
+  if (typeof heldID !== 'string') throw new Error('Missing held prompt ID.');
+  assert.throws(() => r.getQueuedImages(heldID), /Queued image preview has expired\./);
+  await r.client.request('release_queued_admission', { failed: outcome === 'failed', local: outcome === 'local' });
+  if (outcome === 'admitted') {
+    await waitUntil(() => r.summary().queuedFollowUps[0]?.imageCount === 2);
+    assert.deepEqual(r.getQueuedImages(queuedImageRef(r.summary().queuedFollowUps[0]))[0], image);
+    await r.client.request('deliver_queued', { queue: 'followUp' });
+  }
+  assert.throws(() => r.getQueuedImages(heldID), /Queued image preview has expired\./);
+  await r.sendPrompt('same');
+  await waitUntil(() => r.summary().queuedFollowUps.length === 1);
+  assert.deepEqual(queueContents(r.summary().queuedFollowUps), [{ text: 'same', imageCount: 0 }]);
+});
+
+test('literal image marker text never invents an attachment and annotations do not leak between runtimes or reconnects', async t => {
+  const a = await fixture(t, { history: 'empty', nativeQueues: true });
+  const b = await fixture(t, { history: 'empty', nativeQueues: true });
+  await Promise.all([a.runtime.connect(a.executable), b.runtime.connect(b.executable)]);
+  const image = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  await Promise.all([a.runtime.sendPrompt('Working'), b.runtime.sendPrompt('Working')]);
+  await a.runtime.sendPrompt('', { images: [image] });
+  await b.runtime.sendPrompt('[Image]');
+  assert.deepEqual(queueContents(a.runtime.summary().queuedFollowUps), [{ text: '', imageCount: 1 }]);
+  assert.deepEqual(queueContents(b.runtime.summary().queuedFollowUps), [{ text: '[Image]', imageCount: 0 }]);
+  const imageRef = queuedImageRef(a.runtime.summary().queuedFollowUps[0]);
+  assert.deepEqual(a.runtime.getQueuedImages(imageRef)[0], image);
+  assert.throws(() => b.runtime.getQueuedImages(imageRef), /Queued image preview has expired\./);
+  await a.runtime.shutdown();
+  assert.throws(() => a.runtime.getQueuedImages(imageRef), /Queued image preview has expired\./);
+  await a.runtime.connect(a.executable);
+  assert.throws(() => a.runtime.getQueuedImages(imageRef), /Queued image preview has expired\./);
+  await a.runtime.client.request('set_queue_state', { followUp: ['[Image]'], events: [{ type: 'queue_update', steering: [], followUp: ['[Image]'] }] });
+  assert.deepEqual(queueContents(a.runtime.summary().queuedFollowUps), [{ text: '[Image]', imageCount: 0 }]);
+  assert.throws(() => a.runtime.getQueuedImages(imageRef), /Queued image preview has expired\./);
+});
+
+for (const queue of ['steering', 'followUp'] as const) for (const content of ['text', 'image', 'image-only'] as const) {
+  test(`retracting ${queue} ${content} restores exact editor content without sending or changing other queued entries`, async t => {
+    const f = await fixture(t, { history: 'empty', nativeQueues: true });
+    const r = f.runtime;
+    await r.connect(f.executable);
+    const image: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+    const otherImage: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AQ==' };
+    const message = content === 'image-only' ? '' : '  Edit this\nexactly  ';
+    const images = content === 'text' ? [] : [image, image];
+    const steer = queue === 'steering';
+    await r.sendPrompt('Working turn');
+    await r.sendPrompt('Before', { steer, images: [otherImage] });
+    await r.sendPrompt(message, { steer, images });
+    await r.sendPrompt('After', { steer, images: [otherImage] });
+    await r.sendPrompt('Other queue', { steer: !steer, images: [otherImage] });
+    const before = r.summary();
+    const ownEntries = steer ? before.queuedSteers : before.queuedFollowUps;
+    const target = ownEntries[1];
+    assert.ok(target);
+    const removed = await r.retractQueued(queue, message, target.imageRef);
+    assert.deepEqual(removed, { text: message, images, imagesDropped: false });
+    const after = r.summary();
+    assert.deepEqual(steer ? after.queuedSteers : after.queuedFollowUps, [ownEntries[0], ownEntries[2]]);
+    assert.deepEqual(steer ? after.queuedFollowUps : after.queuedSteers, steer ? before.queuedFollowUps : before.queuedSteers);
+    const imageRef = target.imageRef;
+    if (imageRef) assert.throws(() => r.getQueuedImages(imageRef), /expired/);
+    for (const entry of [...after.queuedSteers, ...after.queuedFollowUps]) {
+      assert.deepEqual(r.getQueuedImages(queuedImageRef(entry)), [otherImage]);
+    }
+    const logged = await commands(f.root);
+    assert.deepEqual(logged.filter(frame => frame.type === 'remove_queued_message').map(frame => ({ queue: frame.queue, message: frame.message })), [{ queue, message }]);
+    assert.equal(logged.filter(frame => frame.type === 'prompt').length, 5);
+    assert.equal(r.snapshot().messages.some(entry => entry.text === message), false);
+    assert.deepEqual(f.cache.get(f.record.id)?.queuedSteers, after.queuedSteers);
+    assert.deepEqual(f.cache.get(f.record.id)?.queuedFollowUps, after.queuedFollowUps);
+  });
+}
+
+for (const queue of ['steering', 'followUp'] as const) test(`ambiguous ${queue} image duplicates and stale references never remove another picture`, async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  const first: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  const second: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AQ==' };
+  const steer = queue === 'steering';
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('same', { steer, images: [first] });
+  await r.sendPrompt('same', { steer, images: [second] });
+  const entries = steer ? r.summary().queuedSteers : r.summary().queuedFollowUps;
+  const firstRef = queuedImageRef(entries[0]), secondRef = queuedImageRef(entries[1]);
+  await assert.rejects(r.retractQueued(queue, 'same', firstRef), /cannot be retracted safely/);
+  await assert.rejects(r.retractQueued(queue, 'same', secondRef), /cannot be retracted safely/);
+  assert.equal(await r.retractQueued(queue, 'same', 'expired-reference'), null);
+  assert.equal(await r.retractQueued(queue, 'same', null), null);
+  assert.equal(await r.retractQueued(steer ? 'followUp' : 'steering', 'same', secondRef), null);
+  assert.equal((await commands(f.root)).some(frame => frame.type === 'remove_queued_message'), false);
+  assert.deepEqual(r.getQueuedImages(firstRef), [first]);
+  assert.deepEqual(r.getQueuedImages(secondRef), [second]);
+  await r.client.request('deliver_queued', { queue });
+  assert.equal(await r.retractQueued(queue, 'same', firstRef), null);
+  assert.deepEqual(await r.retractQueued(queue, 'same', secondRef), { text: 'same', images: [second], imagesDropped: false });
+  assert.deepEqual(steer ? r.summary().queuedSteers : r.summary().queuedFollowUps, []);
+  assert.deepEqual(r.snapshot().messages.find(entry => entry.id === 'delivered-queue-1')?.images, [first]);
+  await r.client.request('finish_native_turn');
+  await waitUntil(() => r.canRefreshProviderConnections);
+});
+
+test('mixed image and text duplicates reject even when the selected duplicate has no images', async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('same');
+  await r.sendPrompt('same', { images: [{ type: 'image', mimeType: 'image/png', data: 'AA==' }] });
+  await assert.rejects(r.retractQueued('followUp', 'same', null), /cannot be retracted safely/);
+  assert.equal((await commands(f.root)).some(frame => frame.type === 'remove_queued_message'), false);
+  assert.equal(r.summary().queuedFollowUps.length, 2);
+});
+
+test('text-only duplicates can retract one FIFO occurrence while literal image text stays text', async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('[Image]');
+  await r.sendPrompt('[Image]');
+  assert.deepEqual(await r.retractQueued('followUp', '[Image]', null), { text: '[Image]', images: [], imagesDropped: false });
+  assert.deepEqual(queueContents(r.summary().queuedFollowUps), [{ text: '[Image]', imageCount: 0 }]);
+  assert.deepEqual(await r.retractQueued('followUp', '[Image]', null), { text: '[Image]', images: [], imagesDropped: false });
+  assert.equal(await r.retractQueued('followUp', '[Image]', null), null);
+  await r.client.request('finish_native_turn');
+  await waitUntil(() => r.canRefreshProviderConnections);
+  assert.equal((await commands(f.root)).filter(frame => frame.type === 'remove_queued_message').length, 2);
+  assert.equal((await commands(f.root)).filter(frame => frame.type === 'prompt').length, 3);
+});
+
+for (const queue of ['steering', 'followUp'] as const) test(`${queue} retraction distinguishes image-only raw text from a literal image chip`, async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  const image: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  const steer = queue === 'steering';
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('', { steer, images: [image] });
+  await r.sendPrompt('[Image]', { steer });
+  const imageRef = queuedImageRef((steer ? r.summary().queuedSteers : r.summary().queuedFollowUps)[0]);
+  assert.deepEqual(await r.retractQueued(queue, '[Image]', null), { text: '[Image]', images: [], imagesDropped: false });
+  assert.deepEqual(steer ? r.summary().queuedSteers : r.summary().queuedFollowUps, [{ text: '', imageCount: 1, imageRef }]);
+  assert.deepEqual(r.getQueuedImages(imageRef), [image]);
+  assert.deepEqual(await r.retractQueued(queue, '', imageRef), { text: '', images: [image], imagesDropped: false });
+  assert.deepEqual(steer ? r.summary().queuedSteers : r.summary().queuedFollowUps, []);
+  await r.client.request('finish_native_turn');
+  await waitUntil(() => r.canRefreshProviderConnections);
+  assert.deepEqual((await commands(f.root)).filter(frame => frame.type === 'remove_queued_message').map(frame => frame.message), ['[Image]', '']);
+});
+
+test('delivery immediately before native removal returns null without recovering images from history', async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  const image: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('Already delivered', { images: [image] });
+  await r.sendPrompt('Still queued', { steer: true, images: [image] });
+  const imageRef = queuedImageRef(r.summary().queuedFollowUps[0]);
+  const unrelated = r.summary().queuedSteers;
+  await r.client.request('queue_removal_behavior', { deliverBefore: true });
+  assert.equal(await r.retractQueued('followUp', 'Already delivered', imageRef), null);
+  assert.deepEqual(r.summary().queuedFollowUps, []);
+  assert.deepEqual(r.summary().queuedSteers, unrelated);
+  assert.throws(() => r.getQueuedImages(imageRef), /expired/);
+  assert.deepEqual(r.snapshot().messages.find(entry => entry.id === 'delivered-queue-1')?.images, [image]);
+  assert.equal(await r.retractQueued('followUp', 'Already delivered', imageRef), null);
+  assert.equal((await commands(f.root)).filter(frame => frame.type === 'remove_queued_message').length, 1);
+});
+
+for (const mode of ['returned', 'omitted', 'dropped', 'native-returned', 'native-dropped'] as const) {
+  test(`native ${mode} image response restores only authoritative or explicitly dropped tracked bytes`, async t => {
+    const f = await fixture(t, { history: 'empty', nativeQueues: true });
+    const r = f.runtime;
+    await r.connect(f.executable);
+    const tracked: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+    const actual: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AQ==' };
+    const native = mode.startsWith('native-');
+    await r.sendPrompt('Working turn');
+    if (native) await r.client.request('prompt', { message: 'Edit', images: [actual], streamingBehavior: 'followUp' });
+    else await r.sendPrompt('Edit', { images: [tracked] });
+    const target = r.summary().queuedFollowUps[0];
+    assert.ok(target);
+    await r.client.request('queue_removal_behavior', { ...(mode === 'returned' ? { images: [actual] } : {}), omitImages: mode === 'omitted', dropImages: mode.endsWith('dropped') });
+    assert.deepEqual(await r.retractQueued('followUp', 'Edit', target.imageRef), {
+      text: 'Edit',
+      images: mode === 'omitted' || mode === 'native-dropped' ? [] : mode === 'dropped' ? [tracked] : [actual],
+      imagesDropped: mode === 'native-dropped',
+    });
+    assert.deepEqual(r.summary().queuedFollowUps, []);
+    const imageRef = target.imageRef;
+    if (imageRef) assert.throws(() => r.getQueuedImages(imageRef), /expired/);
+    await r.client.request('finish_native_turn');
+    await waitUntil(() => r.canRefreshProviderConnections);
+  });
+}
+
+for (const result of [
+  { removed: 'yes' },
+  { removed: true, imagesDropped: 'yes' },
+  { removed: true, images: {} },
+  { removed: true, images: [{ type: 'image', mimeType: 'image/png', data: 'not base64' }] },
+  { removed: true, images: Array.from({ length: 21 }, () => ({ type: 'image', mimeType: 'image/png', data: 'AA==' })) },
+] satisfies JsonRecord[]) test(`malformed native removal ${JSON.stringify(result).slice(0, 80)} cannot restore external payload`, async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('Edit', { images: [{ type: 'image', mimeType: 'image/png', data: 'AA==' }] });
+  const imageRef = queuedImageRef(r.summary().queuedFollowUps[0]);
+  await r.client.request('queue_removal_behavior', { result, notify: false });
+  await assert.rejects(r.retractQueued('followUp', 'Edit', imageRef), /invalid/);
+  assert.deepEqual(r.summary().queuedFollowUps, []);
+  assert.throws(() => r.getQueuedImages(imageRef), /expired/);
+  assert.equal((await commands(f.root)).filter(frame => frame.type === 'prompt').length, 2);
+});
+
+test('a queue clear while native removal waits cannot replay its captured images', async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('Edit', { images: [{ type: 'image', mimeType: 'image/png', data: 'AA==' }] });
+  const imageRef = queuedImageRef(r.summary().queuedFollowUps[0]);
+  await r.client.request('queue_removal_behavior', { hold: true, dropImages: true });
+  const removal = r.retractQueued('followUp', 'Edit', imageRef);
+  await heldQueueRemoval(r.client);
+  await r.client.request('clear_queued');
+  assert.throws(() => r.getQueuedImages(imageRef), /expired/);
+  await r.client.request('release_queue_removal');
+  assert.equal(await removal, null);
+  assert.deepEqual(r.summary().queuedFollowUps, []);
+  await r.client.request('finish_native_turn');
+  await waitUntil(() => r.canRefreshProviderConnections);
+});
+
+test('shutdown fences a removed payload and queued operations from the next runtime generation', async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('Edit', { images: [{ type: 'image', mimeType: 'image/png', data: 'AA==' }] });
+  const imageRef = queuedImageRef(r.summary().queuedFollowUps[0]);
+  await r.client.request('queue_removal_behavior', { holdResponse: true, dropImages: true });
+  const removal = r.retractQueued('followUp', 'Edit', imageRef);
+  await heldQueueRemoval(r.client);
+  const stalePromotion = r.promoteQueued('Edit');
+  await r.shutdown();
+  assert.equal(await removal, null);
+  assert.equal(await stalePromotion, false);
+  await r.connect(f.executable);
+  assert.deepEqual(r.summary().queuedFollowUps, []);
+  assert.deepEqual(r.summary().queuedSteers, []);
+  assert.throws(() => r.getQueuedImages(imageRef), /expired/);
+  assert.equal((await commands(f.root)).filter(frame => frame.type === 'remove_queued_message').length, 1);
+  assert.equal((await commands(f.root)).some(frame => frame.type === 'promote_queued_message'), false);
+});
+
+test('promotion and retraction share a serial queue and preserve the surviving image identity', async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  const image: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  const other: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AQ==' };
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('Withdraw', { images: [image] });
+  await r.sendPrompt('Promote', { images: [other] });
+  const withdrawRef = queuedImageRef(r.summary().queuedFollowUps[0]);
+  const promoteRef = queuedImageRef(r.summary().queuedFollowUps[1]);
+  await r.client.request('queue_removal_behavior', { hold: true, dropImages: true });
+  const removal = r.retractQueued('followUp', 'Withdraw', withdrawRef);
+  await heldQueueRemoval(r.client);
+  const promotion = r.promoteQueued('Promote');
+  const secondRemoval = r.retractQueued('followUp', 'Promote', promoteRef);
+  await r.client.request('fixture_status');
+  assert.equal((await commands(f.root)).some(frame => frame.type === 'promote_queued_message'), false);
+  await r.client.request('release_queue_removal');
+  assert.deepEqual(await removal, { text: 'Withdraw', images: [image], imagesDropped: false });
+  assert.equal(await promotion, true);
+  assert.equal(await secondRemoval, null);
+  assert.deepEqual(r.summary().queuedFollowUps, []);
+  assert.deepEqual(r.summary().queuedSteers, [{ text: 'Promote', imageCount: 1, imageRef: promoteRef }]);
+  assert.deepEqual(r.getQueuedImages(promoteRef), [other]);
+  assert.deepEqual(await r.retractQueued('steering', 'Promote', promoteRef), { text: 'Promote', images: [other], imagesDropped: false });
+  await r.client.request('finish_native_turn');
+  await waitUntil(() => r.canRefreshProviderConnections);
+  const operations = (await commands(f.root)).filter(frame => frame.type === 'remove_queued_message' || frame.type === 'promote_queued_message');
+  assert.deepEqual(operations.map(frame => ({ type: frame.type, message: frame.message })), [
+    { type: 'remove_queued_message', message: 'Withdraw' },
+    { type: 'promote_queued_message', message: 'Promote' },
+    { type: 'remove_queued_message', message: 'Promote' },
+  ]);
+});
+
+test('editing a duplicate sent prompt replaces only the selected continuation and preserves its native images', async t => {
+  const f = await fixture(t, { editing: true, catalogImages: true });
+  await f.runtime.connect(f.executable);
+  const before = f.runtime.snapshot();
+  assert.equal(before.messages[2]?.text, 'Repeated prompt');
+  assert.equal(await f.runtime.editMessage('history-2', 'Edited second turn'), true);
+  await waitUntil(() => f.runtime.summary().status.kind === 'ready' && !isBusy(f.runtime.summary().status) && f.runtime.snapshot().messages.some(message => message.text === 'Response to edited turn'));
+  const after = f.runtime.snapshot();
+  assert.deepEqual(after.messages.map(message => message.text), ['Repeated prompt', 'First answer', 'Edited second turn', 'Response to edited turn']);
+  assert.deepEqual(after.messages[2]?.images, before.messages[2]?.images);
+  assert.equal(f.runtime.record.ompSessionFile, join(f.root, 'edited.jsonl'));
+  assert.equal(after.status.kind === 'ready' && after.status.activity, 'idle');
+  const observed = new Map<string, RuntimeSnapshot>();
+  for (const event of f.events) {
+    reduceRuntime(observed, event);
+    const visible = observed.get(f.record.id)?.messages.map(message => message.text) ?? [];
+    assert.ok(!(visible.includes('Later answer to replace') && visible.includes('Edited second turn')), 'An edited turn was appended to stale pre-branch history before the replacement snapshot.');
+  }
+});
+
+test('rejected edited prompt admission restores native history and retains the original rendered message identity', async t => {
+  const f = await fixture(t, { editing: true, catalogImages: true });
+  await f.runtime.connect(f.executable);
+  const before = f.runtime.snapshot();
+  const marker = f.events.length;
+  await assert.rejects(f.runtime.editMessage('history-2', 'reject-edit'), /Input hook rejected/);
+  assert.deepEqual(f.runtime.snapshot().messages, before.messages);
+  assert.equal(f.runtime.record.ompSessionFile, join(f.root, 'original.jsonl'));
+  const native = await f.runtime.client.request('get_state');
+  assert.ok(isRecord(native)); assert.equal(native.sessionFile, join(f.root, 'original.jsonl'));
+  assert.ok(!f.events.slice(marker).some(event => event.kind === 'snapshot' && event.runtime.messages.length < before.messages.length), 'Rejected admission exposed truncated history to the inline editor.');
+  assert.equal(await f.runtime.editMessage('history-2', 'Retry with a new edit'), true);
+  assert.equal(f.runtime.snapshot().messages[2]?.text, 'Retry with a new edit');
+});
+
+test('branch cancellation, queued work, stale targets and oversized edits never replace native history', async t => {
+  const f = await fixture(t, { editing: true });
+  await f.runtime.connect(f.executable);
+  const before = f.runtime.snapshot().messages;
+  await f.runtime.client.request('edit_behavior', { cancel: true });
+  await assert.rejects(f.runtime.editMessage('history-2', 'Edited'), /cancelled/);
+  assert.deepEqual(f.runtime.snapshot().messages, before);
+  await f.runtime.client.request('edit_behavior', { cancel: false });
+  await f.runtime.client.request('set_queue_state', { followUp: ['Queued work'] });
+  await assert.rejects(f.runtime.editMessage('history-2', 'Edited'), /queued work/);
+  await f.runtime.client.request('set_queue_state', { followUp: [] });
+  await f.runtime.refreshState();
+  await assert.rejects(f.runtime.editMessage('missing', 'Edited'), /no longer available/);
+  await assert.rejects(f.runtime.editMessage('history-2', 'x'.repeat(1_048_576)), /input limit/);
+  assert.deepEqual(f.runtime.snapshot().messages, before);
+  assert.equal(await f.runtime.editMessage('history-0', 'Edit the first turn'), true);
+  await waitUntil(() => !isBusy(f.runtime.summary().status) && f.runtime.snapshot().messages.some(message => message.text === 'Response to edited turn'));
+  assert.deepEqual(f.runtime.snapshot().messages.map(message => message.text), ['Edit the first turn', 'Response to edited turn']);
+});
+
+test('sent-message edits keep an unrelated composer draft and persist the selected native session file', async t => {
+  const f = await applicationFixture(t, 'pages', { selected: true, editing: true });
+  try {
+    const first = f.threads[0]; assert.ok(first);
+    const runtime = await f.app.runtimeFor(first.id);
+    await waitUntil(() => runtime.canRefreshProviderConnections);
+    f.app.setDraft(first.id, 'Keep this separate composer draft');
+    assert.equal(await f.app.editMessage(first.id, 'history-2', 'Revised question'), true);
+    const thread = f.app.manifest.threads.find(thread => thread.id === first.id); assert.ok(thread);
+    assert.equal(thread.draft, 'Keep this separate composer draft');
+    assert.equal(thread.ompSessionFile, join(f.root, 'edited.jsonl'));
+    await f.app.shutdown();
+    const saved = (await f.persistence.load()).threads.find(thread => thread.id === first.id);
+    assert.equal(saved?.ompSessionFile, join(f.root, 'edited.jsonl'));
+    assert.equal(saved?.draft, 'Keep this separate composer draft');
+  } finally { await f.app.shutdown(); }
+});
+
+test('work starting during history lookup prevents editing from branching away from active work', async t => {
+  const f = await fixture(t, { editing: true });
+  await f.runtime.connect(f.executable);
+  const before = f.runtime.snapshot().messages;
+  await f.runtime.client.request('edit_behavior', { startWork: true });
+  await assert.rejects(f.runtime.editMessage('history-2', 'Unsafe edit'), /current and queued work/);
+  assert.deepEqual(f.runtime.snapshot().messages, before);
+  const native = await f.runtime.client.request('get_state'); assert.ok(isRecord(native));
+  assert.equal(native.sessionFile, join(f.root, 'original.jsonl'));
+  assert.ok(!(await commands(f.root)).some(frame => frame.type === 'branch'));
 });

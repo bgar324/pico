@@ -21,13 +21,13 @@ for size in [16, 32, 128, 256, 512] {
         let tile = NSRect(x: side * 0.08, y: side * 0.08, width: side * 0.84, height: side * 0.84)
         NSBezierPath(roundedRect: tile, xRadius: side * 0.185, yRadius: side * 0.185).fill()
 
-        // The reference's square-ended pi: nine units wide, ten units tall.
-        // Its right leg extends farther down than its left leg.
+        // Square-ended pi: nine units wide, eight tall, with a longer right leg.
+        // Shift right and down from bounds-centering to balance the top/left-heavy ink.
         let unit = side / 18
-        let origin = NSPoint(x: side * 0.25, y: side * 0.5 + unit * 5)
-        NSColor(srgbRed: 56.0 / 255, green: 56.0 / 255, blue: 56.0 / 255, alpha: 1).setFill()
+        let origin = NSPoint(x: side * 0.25 + unit * 0.25, y: side * 0.5 + unit * 3.5)
+        NSColor(srgbRed: 150.0 / 255, green: 150.0 / 255, blue: 150.0 / 255, alpha: 1).setFill()
         let mark = NSBezierPath()
-        for (x, y, width, height) in [(0.0, 0.0, 9.0, 2.0), (1.0, 2.0, 2.0, 5.5), (4.5, 2.0, 2.0, 8.0)] {
+        for (x, y, width, height) in [(0.0, 0.0, 9.0, 1.75), (1.0, 1.75, 2.0, 4.75), (4.5, 1.75, 2.0, 6.25)] {
             mark.appendRect(NSRect(x: origin.x + x * unit, y: origin.y - (y + height) * unit, width: width * unit, height: height * unit))
         }
         mark.fill()

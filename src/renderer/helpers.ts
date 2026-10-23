@@ -1,4 +1,4 @@
-import type { AppSnapshot, ChatMessage, GitDiff, GitSnapshot, ImageAttachment, Json, JsonRecord, RuntimeEvent, RuntimeSnapshot, ThreadRecord, ToolActivity } from '../shared/types';
+import type { AppSnapshot, ChatMessage, GitDiff, GitSnapshot, ImageAttachment, Json, JsonRecord, QueuedMessage, RetractedMessage, RuntimeEvent, RuntimeSnapshot, ThreadRecord, ToolActivity } from '../shared/types';
 import { isTodoPhases } from '../shared/todos';
 import { imageByteCount, isImageContent } from '../shared/validation';
 
@@ -17,6 +17,13 @@ export function isGitDiff(value: unknown): value is GitDiff { return isRecord(va
 export function isAttachments(value: unknown): value is ImageAttachment[] {
   return Array.isArray(value) && value.length <= 20 && value.every(item => isRecord(item) && typeof item.id === 'string' && typeof item.name === 'string' && isImageContent(item.frame) && item.byteCount === imageByteCount(item.frame));
 }
+export function isRetractedMessage(value: unknown): value is RetractedMessage {
+  return isRecord(value) && typeof value.text === 'string' && typeof value.imagesDropped === 'boolean' && Array.isArray(value.images) && value.images.every(isImageContent);
+}
+function isQueuedMessages(value: unknown): value is QueuedMessage[] {
+  return Array.isArray(value) && value.every(item => isRecord(item) && typeof item.text === 'string' && typeof item.imageCount === 'number' && Number.isSafeInteger(item.imageCount) && item.imageCount >= 0 &&
+    (item.imageCount === 0 ? item.imageRef === null : typeof item.imageRef === 'string' && item.imageRef.length > 0 && !item.imageRef.includes('\0')));
+}
 function isMessage(value: unknown): value is ChatMessage {
   if (!isRecord(value) || value.customType !== undefined && typeof value.customType !== 'string' || value.details !== undefined && (!isRecord(value.details) || !isJson(value.details))) return false;
   if (value.display !== undefined && typeof value.display !== 'boolean') return false;
@@ -24,7 +31,7 @@ function isMessage(value: unknown): value is ChatMessage {
   return isRecord(value) && typeof value.id === 'string' && typeof value.role === 'string' && typeof value.text === 'string' && typeof value.thinking === 'string' && (value.error === null || typeof value.error === 'string') && typeof value.isStreaming === 'boolean' && Array.isArray(value.toolIDs) && value.toolIDs.every(id => typeof id === 'string');
 }
 function isTool(value: unknown): value is ToolActivity {
-  return isRecord(value) && typeof value.id === 'string' && typeof value.name === 'string' && typeof value.target === 'string' && typeof value.detail === 'string' && typeof value.output === 'string' && ['pending', 'running', 'succeeded', 'failed', 'interrupted'].includes(String(value.state)) && typeof value.startedAt === 'number' && (value.endedAt === null || typeof value.endedAt === 'number');
+  return isRecord(value) && typeof value.id === 'string' && typeof value.name === 'string' && typeof value.target === 'string' && typeof value.detail === 'string' && (value.input === undefined || typeof value.input === 'string') && typeof value.output === 'string' && ['pending', 'running', 'succeeded', 'failed', 'interrupted'].includes(String(value.state)) && typeof value.startedAt === 'number' && (value.endedAt === null || typeof value.endedAt === 'number');
 }
 function isWorkPeriods(value: unknown): boolean {
   if (!Array.isArray(value) || value.length > 32) return false;
@@ -50,7 +57,7 @@ export function isRuntimeSnapshot(value: unknown): value is RuntimeSnapshot {
   if (usage !== null && (!isRecord(usage) || typeof usage.tokens !== 'number' || !Number.isFinite(usage.tokens) || usage.tokens < 0 || typeof usage.contextWindow !== 'number' || !Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0)) return false;
   if (value.workPeriods !== undefined && !isWorkPeriods(value.workPeriods)) return false;
   if (!isTodoPhases(value.todoPhases) || !Array.isArray(value.subagents) || !value.subagents.every(agent => isRecord(agent) && (agent.messageID === null || typeof agent.messageID === 'string'))) return false;
-  return (value.error === null || typeof value.error === 'string') && (value.notice === null || typeof value.notice === 'string') && typeof value.selectedModelID === 'string' && typeof value.thinkingLevel === 'string' && Array.isArray(value.thinkingLevels) && value.thinkingLevels.every(item => typeof item === 'string') && Array.isArray(value.queuedFollowUps) && value.queuedFollowUps.every(item => typeof item === 'string') && Array.isArray(value.queuedSteers) && value.queuedSteers.every(item => typeof item === 'string') && Array.isArray(value.models) && value.models.every(model => isRecord(model) && typeof model.id === 'string' && typeof model.provider === 'string' && typeof model.modelID === 'string' && typeof model.name === 'string' && typeof model.supportsImages === 'boolean') && Array.isArray(value.dialogs) && value.dialogs.every(dialog => isRecord(dialog) && typeof dialog.id === 'string' && ['confirm', 'select', 'input', 'editor', 'ask'].includes(String(dialog.method)) && typeof dialog.title === 'string' && typeof dialog.message === 'string' && isRecord(dialog.frame) && isJson(dialog.frame) && (dialog.deadline === null || typeof dialog.deadline === 'number') && (dialog.error === null || typeof dialog.error === 'string')) && Array.isArray(value.subagents) && value.subagents.every(agent => isRecord(agent) && typeof agent.id === 'string' && typeof agent.title === 'string' && typeof agent.status === 'string' && typeof agent.detail === 'string') && Array.isArray(value.messages) && value.messages.every(isMessage) && Array.isArray(value.tools) && value.tools.every(isTool);
+  return (value.error === null || typeof value.error === 'string') && (value.notice === null || typeof value.notice === 'string') && typeof value.selectedModelID === 'string' && typeof value.thinkingLevel === 'string' && Array.isArray(value.thinkingLevels) && value.thinkingLevels.every(item => typeof item === 'string') && isQueuedMessages(value.queuedFollowUps) && isQueuedMessages(value.queuedSteers) && Array.isArray(value.models) && value.models.every(model => isRecord(model) && typeof model.id === 'string' && typeof model.provider === 'string' && typeof model.modelID === 'string' && typeof model.name === 'string' && typeof model.supportsImages === 'boolean') && Array.isArray(value.dialogs) && value.dialogs.every(dialog => isRecord(dialog) && typeof dialog.id === 'string' && ['confirm', 'select', 'input', 'editor', 'ask'].includes(String(dialog.method)) && typeof dialog.title === 'string' && typeof dialog.message === 'string' && isRecord(dialog.frame) && isJson(dialog.frame) && (dialog.deadline === null || typeof dialog.deadline === 'number') && (dialog.error === null || typeof dialog.error === 'string')) && Array.isArray(value.subagents) && value.subagents.every(agent => isRecord(agent) && typeof agent.id === 'string' && typeof agent.title === 'string' && typeof agent.status === 'string' && typeof agent.detail === 'string') && Array.isArray(value.messages) && value.messages.every(isMessage) && Array.isArray(value.tools) && value.tools.every(isTool);
 }
 export function isAppSnapshot(value: unknown): value is AppSnapshot {
   if (!isRecord(value) || !isRecord(value.manifest) || !isRecord(value.preferences)) return false;

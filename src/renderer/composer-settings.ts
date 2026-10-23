@@ -26,7 +26,7 @@ class ComposerChoice {
   private modal: Modal | null = null;
   private renderModels: (() => void) | null = null;
 
-  constructor(private readonly kind: 'model' | 'thinking', private readonly parent: Menu, private readonly returnFocus: () => void) {
+  constructor(private readonly kind: 'model' | 'thinking', private readonly parent: Menu, private readonly returnFocus: () => void, private readonly onSelection: () => void) {
     this.node = button('', () => this.open(), 'menu-option composer-setting-row');
     this.node.setAttribute('role', 'menuitem');
     this.node.setAttribute('aria-label', kind === 'model' ? 'Model' : 'Thinking level');
@@ -40,6 +40,7 @@ class ComposerChoice {
     });
   }
   get value(): string { return this.selectedValue; }
+  selectedLabel = '';
   set value(value: string) {
     if (this.selectedValue === value && this.renderedValue !== null) return;
     this.selectedValue = value;
@@ -52,13 +53,14 @@ class ComposerChoice {
     if (value) this.dismiss();
   }
   setOptions(options: readonly SelectOption[]): void {
-    if (this.options === options || this.options.length === options.length && this.options.every((option, index) => option.value === options[index]?.value && option.label === options[index]?.label)) return;
+    if (this.options === options || this.options.length === options.length && this.options.every((option, index) => option.value === options[index]?.value && option.label === options[index]?.label && option.description === options[index]?.description)) return;
     this.options = options;
     this.renderSelection();
   }
   private renderSelection(): void {
     const value = this.selectedValue;
     const text = this.options.find(option => option.value === value)?.label ?? value;
+    this.selectedLabel = text;
     if (this.renderedLabel !== text) {
       this.label.replaceChildren(element('small', 'muted', this.kind === 'model' ? 'Model' : 'Thinking'), element('span', '', text || 'Unavailable'));
       this.node.title = text;
@@ -71,6 +73,7 @@ class ComposerChoice {
     }
     this.renderModels?.();
     if (this.menu.node.matches(':popover-open')) this.renderThinking();
+    this.onSelection();
   }
   dismiss(): void { this.modal?.close(); this.menu.close(false); }
   private choose(value: string): void {
@@ -101,11 +104,13 @@ class ComposerChoice {
       const focusedValue = results.contains(document.activeElement) && document.activeElement instanceof HTMLElement ? document.activeElement.dataset.value : undefined;
       const query = search.value.trim().toLocaleLowerCase(); results.replaceChildren();
       for (const option of this.options) {
-        if (!option.value || !`${option.label} ${option.value}`.toLocaleLowerCase().includes(query)) continue;
+        if (!option.value || !`${option.label} ${option.description ?? ''} ${option.value}`.toLocaleLowerCase().includes(query)) continue;
         const row = button('', () => { modal.close(); this.choose(option.value); }, 'model-picker-row');
         row.dataset.value = option.value;
         row.setAttribute('aria-pressed', String(option.value === this.value));
-        row.append(icon('model'), element('span', 'menu-label', option.label));
+        const label = element('span', 'menu-label', option.label);
+        if (option.description) label.append(element('small', 'muted', option.description));
+        row.append(icon('model'), label);
         if (option.value === this.value) row.append(icon('check'));
         results.append(row);
       }
@@ -130,18 +135,30 @@ class ComposerChoice {
 
 export class ComposerSettings {
   private readonly menu = new Menu('composer-settings-menu');
-  readonly model = new ComposerChoice('model', this.menu, () => this.focus());
-  readonly thinking = new ComposerChoice('thinking', this.menu, () => this.focus());
+  private readonly modelLabel = element('span', 'composer-model-label', 'Model');
+  private readonly effortLabel = element('span', 'composer-effort-label');
+  readonly node = button('', () => this.menu.open(this.node), 'composer-settings-trigger');
+  readonly model = new ComposerChoice('model', this.menu, () => this.focus(), () => this.updateLabel());
+  readonly thinking = new ComposerChoice('thinking', this.menu, () => this.focus(), () => this.updateLabel());
   readonly contextUsage = element('span', 'context-usage muted', 'Unavailable');
-  readonly node = button('', () => this.menu.open(this.node), 'composer-settings-trigger icon-button');
   constructor() {
-    this.node.append(icon('sliders')); this.node.title = 'Model, thinking, and context';
-    this.node.setAttribute('aria-label', 'Model, thinking, and context'); this.node.setAttribute('aria-haspopup', 'menu'); this.node.setAttribute('aria-expanded', 'false');
+    this.node.append(this.modelLabel, this.effortLabel, icon('chevron-right'));
+    this.node.setAttribute('aria-haspopup', 'menu'); this.node.setAttribute('aria-expanded', 'false');
+    this.updateLabel();
     const context = element('div', 'composer-context-row');
     const text = element('span', 'menu-label'); text.append(element('small', 'muted', 'Context'), this.contextUsage);
     context.append(icon('context'), text); this.menu.node.append(this.model.node, this.thinking.node, context);
     this.menu.node.addEventListener('beforetoggle', event => { if (event instanceof ToggleEvent && event.newState === 'closed') this.thinking.dismiss(); });
   }
   private focus(): void { if (this.node.isConnected && !this.node.closest('[inert]') && this.node.getClientRects().length) this.node.focus({ preventScroll: true }); }
+  private updateLabel(): void {
+    const model = this.model.selectedLabel || 'Model';
+    const effort = this.thinking.selectedLabel;
+    if (this.modelLabel.textContent !== model) this.modelLabel.textContent = model;
+    if (this.effortLabel.textContent !== effort) this.effortLabel.textContent = effort;
+    this.effortLabel.hidden = !effort;
+    const label = `${model}${effort ? `, ${effort} thinking` : ''}. Model, thinking, and context`;
+    this.node.title = label; this.node.setAttribute('aria-label', label);
+  }
   close(): void { this.model.dismiss(); this.thinking.dismiss(); this.menu.close(false); }
 }

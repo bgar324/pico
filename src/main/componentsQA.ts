@@ -139,27 +139,26 @@ export async function runComponentsQA(window: BrowserWindow, controller: AppCont
     await pressTab();
     qa.check((await evaluate('document.querySelector(\"dialog[open]\").contains(document.activeElement)')) === true, `Settings Tab focus stays inside at step ${step+1}`);
   }
-  await evaluate(`document.querySelector('dialog[open] input').focus()`);
+  await evaluate(`document.querySelector('#settings-tab-general').focus()`);
   await pressTab(true);
-  qa.check((await evaluate('document.activeElement === document.querySelector(\".modal-footer button:last-child\")')) === true, 'Settings Shift-Tab wraps to its final control');
+  qa.check((await evaluate('document.activeElement === Array.from(document.querySelectorAll(".settings-footer-actions button:not(:disabled)")).at(-1)')) === true, 'Settings Shift-Tab wraps to its final enabled control');
   await evaluate(`delete document.documentElement.dataset.qaKey`);
   await measure('settings-dark'); await qa.capture('unified-settings-dark');
-  await open('[aria-label="Appearance"]'); await measure('appearance-menu'); await qa.capture('unified-appearance-menu');
-  await choose('Light');
+  await evaluate(`document.querySelector('.settings-appearance-option[data-appearance="light"]').click()`);
   await qa.until('light theme persisted', () => controller.preferences.appearance === 'light');
   await qa.until('light theme rendered', async () => (await evaluate('document.documentElement.dataset.theme')) === 'light');
   await measure('settings-light'); await qa.capture('unified-settings-light');
   const project = controller.manifest.projects.at(-1);
   if (!project) throw new Error('Missing QA project.');
   await open('[aria-label="Default project"]'); await choose(project.path);
-  await evaluate(`document.querySelector('.modal-footer [aria-label="Save"]').click()`);
+  await evaluate(`document.querySelector('.settings-footer-actions .primary').click()`);
   await qa.until('default project saved', () => controller.preferences.defaultProjectPath === project.path);
   qa.check(true, 'Shared Settings controls persist appearance and project preferences');
   await qa.capture('unified-conversation-light');
 
   await evaluate(`document.querySelector('[data-testid=settings]').click()`);
-  await open('[aria-label="Appearance"]');
-  await evaluate(`document.querySelector('.modal-footer [aria-label="Cancel"]').click()`);
+  await open('[aria-label="Default project"]');
+  await evaluate(`document.querySelector('.settings-close').click()`);
   qa.check((await evaluate('!document.querySelector("dialog[open]") && !document.querySelector("[popover]:popover-open")')) === true, 'Closing a dialog dismisses its open dropdown');
   await controller.updatePreferences(originalPreferences);
   await qa.until('original appearance restored', async () => (await evaluate('document.documentElement.dataset.theme')) === controller.info().theme);
@@ -202,7 +201,7 @@ export async function runComponentsQA(window: BrowserWindow, controller: AppCont
     await escape('.composer-settings-menu');
     await evaluate(`document.querySelector('[data-testid=settings]').click()`);
     qa.check((await evaluate('getComputedStyle(document.querySelector("dialog[open]")).animationName')) === 'none', 'Reduced motion disables dialog animation');
-    await evaluate(`document.querySelector('.modal-footer [aria-label="Cancel"]').click()`);
+    await evaluate(`document.querySelector('.settings-close').click()`);
     await window.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', { features:[] });
   } finally { window.webContents.debugger.detach(); }
 

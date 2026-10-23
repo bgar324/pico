@@ -13,7 +13,7 @@ interface Pending { command: string; resolve: (data: Json) => void; reject: (err
 interface WriteItem { bytes: Buffer; signal: AbortSignal | undefined; resolve: () => void; reject: (error: Error) => void; abort: () => void; started: boolean }
 type Phase = 'idle' | 'starting' | 'ready' | 'closing' | 'failed';
 
-export class RpcClient extends EventEmitter<{ event: [JsonRecord] }> {
+export class RpcClient extends EventEmitter<{ event: [JsonRecord]; idle: [] }> {
   private phase: Phase = 'idle';
   private child: ChildProcessWithoutNullStreams | null = null;
   private decoder = new FrameDecoder();
@@ -31,10 +31,11 @@ export class RpcClient extends EventEmitter<{ event: [JsonRecord] }> {
   private shutdownPromise: Promise<void> | null = null;
   private startController: AbortController | null = null;
   get ready(): boolean { return this.phase === 'ready'; }
+  get hasPendingRequests(): boolean { return this.pending.size > 0; }
   get maxInputFrameBytes(): number { return this.decoder.maxFrameBytes; }
   diagnostics(): string { return this.diagnosticBuffer.text; }
 
-  async start(options: { executable: string; projectPath: string; sessionDirectory: string; resume: boolean }): Promise<void> {
+  async start(options: { executable: string; projectPath: string; sessionDirectory: string; resume: boolean; model?: string; sessionFile?: string }): Promise<void> {
     if (this.startController || this.phase === 'starting' || this.phase === 'ready' || this.phase === 'closing') throw new RpcError('invalid', 'This thread already owns an OMP process.');
     const controller = new AbortController();
     this.startController = controller;
@@ -51,7 +52,7 @@ export class RpcClient extends EventEmitter<{ event: [JsonRecord] }> {
     }
   }
 
-  private async launch(options: { executable: string; projectPath: string; sessionDirectory: string; resume: boolean }, signal: AbortSignal): Promise<void> {
+  private async launch(options: { executable: string; projectPath: string; sessionDirectory: string; resume: boolean; model?: string; sessionFile?: string }, signal: AbortSignal): Promise<void> {
     this.phase = 'starting';
     const projectPath = await realpath(options.projectPath).catch(() => { throw new RpcError('invalid', 'The project folder is missing. Locate it before reopening the thread.'); });
     if (!(await stat(projectPath)).isDirectory()) throw new RpcError('invalid', 'The project path is not a folder.');
@@ -66,7 +67,7 @@ export class RpcClient extends EventEmitter<{ event: [JsonRecord] }> {
     const readyPromise = readyGate.promise;
     this.readyResolve = readyGate.resolve; this.readyReject = readyGate.reject;
     const timer = setTimeout(() => this.fail(new RpcError('timeout', 'OMP did not send its ready handshake before the deadline.')), 15000);
-    const child = spawn(options.executable, ['--mode', 'rpc-ui', '--cwd', projectPath, '--session-dir', options.sessionDirectory, ...(options.resume ? ['--continue'] : [])], { cwd: projectPath, env: toolEnvironment(), stdio: ['pipe', 'pipe', 'pipe'], shell: false });
+    const child = spawn(options.executable, ['--mode', 'rpc-ui', '--cwd', projectPath, '--session-dir', options.sessionDirectory, ...(options.sessionFile ? ['--resume', options.sessionFile] : options.resume ? ['--continue'] : []), ...(options.model ? ['--model', options.model] : [])], { cwd: projectPath, env: toolEnvironment(), stdio: ['pipe', 'pipe', 'pipe'], shell: false });
     this.child = child;
     const closed = Promise.withResolvers<void>();
     child.once('close', () => closed.resolve());
@@ -185,6 +186,7 @@ export class RpcClient extends EventEmitter<{ event: [JsonRecord] }> {
         if (command === 'get_messages' || command === 'get_messages_page' || (command === 'set_todos' && frame.success === true) || (command === 'compact' && frame.success === true)) this.emit('event', frame);
         if (frame.success === true) pending.resolve(frame.data ?? null);
         else pending.reject(new RpcError('command', typeof frame.error === 'string' ? frame.error : 'OMP rejected the command.', pending.command, typeof frame.code === 'string' ? frame.code : null));
+        if (!this.pending.size) queueMicrotask(() => { if (this.phase === 'ready' && !this.pending.size) this.emit('idle'); });
       } else if (frame.success === false || command === 'prompt' || command === 'abort_and_prompt' || command === 'compact') this.emit('event', frame);
     } else if (frame.type === 'rpc_frame_error') throw new RpcError('protocol', typeof frame.error === 'string' ? frame.error : 'OMP could not deliver a complete event.');
     else this.emit('event', frame);

@@ -54,3 +54,33 @@ test('context menus accept bounded plain labels and discard renderer action payl
     assert.throws(() => parseRequest({ kind: 'context-menu', items: invalid }));
   }
 });
+
+test('account mutations reject malformed row IDs and unsafe secret payloads without exposing their contents', () => {
+  for (const credentialId of [-1, 0.5, NaN, Infinity, '1', null, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => parseRequest({ kind: 'disconnect-provider', providerId: 'openai', credentialId }));
+  }
+  for (const key of ['', '  ', 'sensitive-first\nsensitive-second', 'sensitive-first\0sensitive-second', 'sensitive-'.repeat(2000)]) {
+    assert.throws(() => parseRequest({ kind: 'save-provider-key', providerId: 'openai', key }), error => {
+      assert.ok(error instanceof Error);
+      assert.doesNotMatch(error.message, /sensitive/);
+      return true;
+    });
+  }
+});
+
+test('queued preview reads require bounded opaque references and valid thread IDs', () => {
+  for (const imageRef of [undefined, null, 1, {}, '', 'x'.repeat(201), 'expired\0reference']) {
+    assert.throws(() => parseRequest({ kind: 'queued-images', id: 'thread', imageRef }));
+  }
+  for (const id of [undefined, null, {}, 1, 'thread\0other']) {
+    assert.throws(() => parseRequest({ kind: 'queued-images', id, imageRef: 'images' }));
+  }
+});
+
+test('queue retraction validates queue identity without changing image-only text', () => {
+  const request = { kind: 'retract-queued', id: 'thread', queue: 'steering', message: '', imageRef: 'picture' };
+  assert.deepEqual(parseRequest(request), request);
+  assert.deepEqual(parseRequest({ ...request, queue: 'followUp', imageRef: null }), { ...request, queue: 'followUp', imageRef: null });
+  for (const queue of [undefined, null, 'follow-up', 'both', {}, 1]) assert.throws(() => parseRequest({ ...request, queue }));
+  for (const imageRef of [undefined, '', 'x'.repeat(201), 'other\0image', {}, 1]) assert.throws(() => parseRequest({ ...request, imageRef }));
+});

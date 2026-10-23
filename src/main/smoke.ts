@@ -247,7 +247,7 @@ export async function runElectronSmoke(window: BrowserWindow, controller: AppCon
     await window.webContents.executeJavaScript(`document.querySelector('[data-testid=settings]')?.click()`);
     await until('settings dialog', async () => (await window.webContents.executeJavaScript('Boolean(document.querySelector(\"dialog[open]\"))')) === true);
     await screenshot(window, evidence, 'electron-settings');
-    await window.webContents.executeJavaScript(`document.querySelector('dialog [aria-label="Cancel"]')?.click()`);
+    await window.webContents.executeJavaScript(`document.querySelector('.settings-close')?.click()`);
     const revisionBeforeEviction = restored.summary().revision;
     await controller.newThread(alpha); await controller.newThread(beta);
     check(!controller.runtimes.has(firstID), 'Fourth conversation recycles only an idle runtime');

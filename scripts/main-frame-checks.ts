@@ -1,6 +1,7 @@
 import { Conversation } from '../src/renderer/conversation';
 import { TodoPanel } from '../src/renderer/todo-panel';
 import type { RuntimeSnapshot } from '../src/shared/types';
+import { SurfacePresence } from '../src/renderer/surface-presence';
 
 function verify(condition: unknown, message: string): void { if (!condition) throw new Error(message); }
 async function settle(): Promise<void> { await new Promise<void>(resolve => window.setTimeout(resolve, 280)); }
@@ -21,6 +22,59 @@ export async function checkMainFrameStates(): Promise<string[]> {
     subagents: [{ id: 'review-agent', title: 'Review agent', status: 'running', detail: 'Inspecting the main frame.', messageID: 'review' }],
   };
   try {
+    const surface = document.createElement('aside');
+    surface.style.cssText = 'height:360px;position:absolute;inset:0 auto auto 0;width:248px';
+    const presence = new SurfacePresence(surface); host.append(surface);
+    try {
+      presence.setVisible(false, true); presence.setVisible(true); await settle();
+      presence.setVisible(false, true);
+      await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+      presence.setVisible(true); await settle();
+      verify(!surface.hidden && !surface.inert && getComputedStyle(surface).opacity === '1',
+        'An instant hide followed by a repeated animated entry left an invisible occupied surface.');
+      presence.setVisible(false);
+      await new Promise<void>(resolve => window.setTimeout(resolve, 155));
+      presence.setVisible(true, true); await settle();
+      verify(!surface.hidden && !surface.inert && getComputedStyle(surface).opacity === '1' && getComputedStyle(surface).translate === '0px',
+        'Snapping a nearly finished exit back open retained a transparent or translated surface.');
+    } finally { presence.dispose(); surface.remove(); }
+    const layout = { ...runtime, id: 'panel-layout' };
+    const agentToggle = panels.controls.querySelector<HTMLButtonElement>('.agent-toggle');
+    const agents = panels.rail.querySelector<HTMLElement>('.agents-panel');
+    if (!agentToggle || !agents) throw new Error('Missing activity panel controls.');
+    panels.update({ ...layout, todoPhases: [], subagents: [] }, layout.id); await settle();
+    verify(parseFloat(getComputedStyle(host).paddingInlineEnd) < 1, 'Empty activity reserved a chat lane.');
+    panels.update({ ...layout, subagents: [] }, layout.id); await settle();
+    verify(panels.node.checkVisibility() && !agents.checkVisibility() && parseFloat(getComputedStyle(host).paddingInlineEnd) > 270, 'Tasks alone did not occupy their docked lane.');
+    panels.update(layout, layout.id); await settle();
+    verify(agents.getBoundingClientRect().top >= panels.node.getBoundingClientRect().bottom, 'Visible Tasks and Agents overlapped instead of stacking.');
+    panels.toggle.click();
+    await new Promise<void>(resolve => window.setTimeout(resolve, 150));
+    const switched = { ...layout, id: 'panel-layout-switched' };
+    panels.update(switched, switched.id); await settle();
+    verify(!panels.node.hidden && !panels.node.inert && getComputedStyle(panels.node).opacity === '1' && getComputedStyle(panels.toggle).opacity === '1',
+      'Switching conversations during a panel exit left Tasks or its toggle transparent.');
+    panels.toggle.click(); await settle();
+    verify(Math.abs(agents.getBoundingClientRect().top - panels.rail.getBoundingClientRect().top) < 1,
+      'Collapsed Tasks retained a blank slot above Agents.');
+    agentToggle.click(); await settle();
+    verify(!panels.node.checkVisibility() && !agents.checkVisibility() && parseFloat(getComputedStyle(host).paddingInlineEnd) < 1,
+      'Collapsing both panels left an empty reserved lane.');
+    panels.update({ ...switched, revision: switched.revision + 1 }, switched.id); await settle();
+    verify(parseFloat(getComputedStyle(host).paddingInlineEnd) < 1, 'A passive activity update reopened the empty chat lane.');
+    agentToggle.click(); await settle();
+    verify(agents.checkVisibility() && Math.abs(agents.getBoundingClientRect().top - panels.rail.getBoundingClientRect().top) < 1 && parseFloat(getComputedStyle(host).paddingInlineEnd) > 270,
+      'Agents alone failed to dock at the top of its occupied lane.');
+    panels.update({ ...switched, todoPhases: [], subagents: [] }, switched.id); await settle();
+    verify(parseFloat(getComputedStyle(host).paddingInlineEnd) < 1, 'Removing all activity retained its lane.');
+    host.style.width = '720px';
+    const compact = { ...layout, id: 'panel-layout-compact' };
+    panels.update(compact, compact.id); await settle();
+    verify(panels.toggle.getAttribute('aria-expanded') === 'false' && agentToggle.getAttribute('aria-expanded') === 'false' && parseFloat(getComputedStyle(host).paddingInlineEnd) < 1,
+      'Compact activity reserved a docked lane before opening.');
+    panels.toggle.click(); await settle();
+    verify(panels.node.checkVisibility() && parseFloat(getComputedStyle(host).paddingInlineEnd) < 1, 'A compact overlay shifted the conversation sideways.');
+    host.style.width = '1100px'; await settle();
     view.update(runtime, runtime.id); panels.update(runtime, runtime.id); await settle();
     editor.focus(); view.showFind(); view.findInput.value = 'searchable sentinel'; view.findInput.dispatchEvent(new Event('input')); await settle();
     const match = view.content.querySelector<HTMLElement>('.advisor-notice.find-match');
@@ -70,10 +124,52 @@ export async function checkMainFrameStates(): Promise<string[]> {
     verify(document.activeElement === summary && summary.parentElement instanceof HTMLDetailsElement && summary.parentElement.open, 'An agent update replaced its focused summary or collapsed its details.');
     panels.update({ ...runtime, todoPhases: [], subagents: [] }, runtime.id); await settle();
     verify(document.activeElement === editor, 'Removing focused activity left keyboard focus on the document body.');
+
+    const disclosureTool = { id: 'disclosure-tool', name: 'glob', target: 'src/**/*.ts', detail: 'Inspect source files', output: 'Found source files.', state: 'succeeded', startedAt: 0, endedAt: 1000 } satisfies RuntimeSnapshot['tools'][number];
+    runtime = { ...runtime, revision: runtime.revision + 1, messages: [
+      { id: 'disclosure-owner', role: 'assistant', text: '', thinking: '', toolIDs: [disclosureTool.id], error: null, isStreaming: false },
+      { id: 'disclosure-advisor', role: 'custom', customType: 'advisor', text: '', thinking: '', toolIDs: [], error: null, isStreaming: false, details: { notes: [{ note: 'Keep the disclosure state through updates.', severity: 'concern' }] } },
+    ], tools: [disclosureTool] };
+    view.update(runtime, runtime.id);
+    const disclosures = ['.activity-group', '.tool', '.advisor-group'];
+    for (const selector of disclosures) {
+      const disclosure = view.content.querySelector<HTMLDetailsElement>(selector), control = disclosure?.querySelector('summary');
+      if (!disclosure || !control) throw new Error(`Missing disclosure fixture: ${selector}`);
+      disclosure.open = false; editor.focus(); await settle();
+      const caret = control.querySelector('.disclosure-caret');
+      if (!caret) throw new Error(`Missing disclosure indicator: ${selector}`);
+      const name = control.querySelector('.activity-current,.tool-name,.advisor-label');
+      const glyph = control.querySelector(':scope > svg:not(.disclosure-caret),:scope > .activity-label > svg');
+      if (!name || !glyph) throw new Error(`Missing preserved icon or label: ${selector}`);
+      const fullText = control.querySelector('.activity-current,.advisor-label') ?? control.querySelector('.tool-target:not(:empty)') ?? name;
+      const nameBounds = name.getBoundingClientRect(), textBounds = fullText.getBoundingClientRect(), caretBounds = caret.getBoundingClientRect(), glyphBounds = glyph.getBoundingClientRect();
+      const textGap = caretBounds.left - textBounds.right;
+      verify(glyphBounds.width === 16 && nameBounds.width > 0 && glyphBounds.right <= nameBounds.left &&
+        textGap > 0 && textGap < 8 && getComputedStyle(glyph).opacity === '1',
+        'The caret was not one compact space after the full row text, or the original icon disappeared.');
+      verify(getComputedStyle(caret).opacity === '0', 'An idle collapsed row retained its caret.');
+      control.click(); editor.focus(); await settle();
+      const openAngle = new DOMMatrix(getComputedStyle(caret).transform);
+      verify(disclosure.open && getComputedStyle(caret).opacity === '1' && getComputedStyle(glyph).opacity === '1' && Math.abs(openAngle.a) < .01 && openAngle.b > .99,
+        'An expanded row lost its downward caret after focus left.');
+      control.click(); editor.focus(); await settle();
+      verify(!disclosure.open && getComputedStyle(caret).opacity === '0', 'Closing a row did not restore its idle caret behavior.');
+      control.click(); await settle();
+    }
+    runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...disclosureTool, output: 'Updated source results.' }],
+      messages: runtime.messages.map(message => message.customType === 'advisor' ? { ...message, details: { notes: [{ note: 'A higher-severity update.', severity: 'blocker' }] } } : message) };
+    view.update(runtime, runtime.id); editor.focus(); await settle();
+    for (const selector of disclosures) {
+      const disclosure = view.content.querySelector<HTMLDetailsElement>(selector), caret = disclosure?.querySelector('summary .disclosure-caret');
+      verify(disclosure?.open && caret && getComputedStyle(caret).opacity === '1' && new DOMMatrix(getComputedStyle(caret).transform).b > .99,
+        'Tool or Advisor updates reset a persistent expanded caret.');
+    }
     return [
       'Find reveals the exact Advisor note, clears on Escape, restores focus, and survives interrupted exits.',
       'Advisor and task updates preserve unchanged selected prose; agent updates preserve focused disclosures.',
       'Compact panels default closed, reverse safely, and return focus when their data disappears.',
+      'Tasks and Agents reserve a lane only while docked and expanded; collapsed, empty, and compact states stay centered, and interrupted thread switches restore opaque panels.',
+      'Activity, tool, and Advisor keep original icons and place carets a small space after the full text; carets persist downward when expanded, hide on collapse, and survive updates.',
     ];
   } finally {
     getSelection()?.removeAllRanges(); panels.dispose(); view.dispose(); host.remove();

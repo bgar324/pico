@@ -1,13 +1,18 @@
 import type { RuntimeSnapshot, TodoItem, TodoPhase, TodoStatus } from '../shared/types';
 import { activeTodo } from '../shared/todos';
 import { element, iconButton } from './dom';
-import { icon, statusIcon } from './icons';
 import { renderMarkdown } from './markdown';
 import { TextShimmer } from './shimmer';
 import { SurfacePresence } from './surface-presence';
 
 const statusLabels: Record<TodoStatus, string> = { pending: 'Pending', in_progress: 'In progress', completed: 'Completed', abandoned: 'Abandoned', blocked: 'Blocked' };
-interface TaskView { node: HTMLLIElement; content: HTMLElement; blocker: HTMLElement; detail: HTMLElement; notes: HTMLElement; status: HTMLElement }
+const agentStatuses: Record<string, TodoStatus | undefined> = {
+  active: 'in_progress', running: 'in_progress', started: 'in_progress', in_progress: 'in_progress',
+  completed: 'completed', succeeded: 'completed', done: 'completed',
+  failed: 'blocked', error: 'blocked', blocked: 'blocked',
+  abandoned: 'abandoned', aborted: 'abandoned', interrupted: 'abandoned', cancelled: 'abandoned',
+};
+interface TaskView { node: HTMLLIElement; content: HTMLElement; blocker: HTMLElement; detail: HTMLElement; notes: HTMLElement }
 interface PhaseView { node: HTMLElement; heading: HTMLElement; list: HTMLElement; tasks: Map<string, TaskView> }
 
 function place(parent: HTMLElement, node: HTMLElement, index: number): void {
@@ -21,7 +26,7 @@ export class TodoPanel {
   readonly rail = element('div', 'activity-rail');
   private readonly agents = element('aside', 'agents-panel');
   private readonly agentList = element('div', 'agents-list');
-  private readonly agentViews = new Map<string, { node: HTMLDetailsElement; title: HTMLElement; state: HTMLElement; detail: HTMLElement }>();
+  private readonly agentViews = new Map<string, { node: HTMLDetailsElement; summary: HTMLElement; title: HTMLElement; detail: HTMLElement }>();
   readonly toggle = iconButton('tasks', 'Tasks', () => this.setCollapsed(this.taskPresence.visible), 'todo-toggle');
   readonly controls = element('div', 'activity-controls');
   private readonly agentCollapsed = new Map<string, boolean>();
@@ -34,9 +39,6 @@ export class TodoPanel {
     if (collapsed) this.agentToggle.focus();
   }, 'agent-toggle');
   private readonly heading = element('h2', '', 'Tasks');
-  private readonly count = element('span', 'todo-count muted');
-  private readonly toggleCount = element('span');
-  private readonly agentCount = element('span');
   private readonly list = element('div', 'todo-phases');
   private readonly collapsed = new Map<string, boolean>();
   private readonly phaseViews = new Map<string, PhaseView>();
@@ -57,13 +59,12 @@ export class TodoPanel {
     this.node.setAttribute('aria-labelledby', this.heading.id);
     this.toggle.setAttribute('aria-controls', this.node.id);
     const header = element('div', 'todo-header');
-    header.append(this.heading, this.count);
+    header.append(this.heading);
     this.node.append(header, this.list);
     this.agents.setAttribute('aria-label', 'Agents');
     this.agents.id = 'agents-panel';
     this.agentToggle.setAttribute('aria-controls', this.agents.id);
     this.controls.append(this.toggle, this.agentToggle);
-    this.toggle.append(this.toggleCount); this.agentToggle.append(this.agentCount);
     this.agents.append(element('h2', '', 'Agents'), this.agentList);
     this.rail.append(this.node, this.agents);
     this.compact = main.clientWidth < 880;
@@ -92,35 +93,33 @@ export class TodoPanel {
     }
     const agents = threadID ? runtime?.subagents ?? [] : [];
     const ids = new Set(agents.map(agent => agent.id));
-    for (const [id, view] of this.agentViews) if (!ids.has(id)) { view.node.remove(); this.agentViews.delete(id); }
+    for (const [id, view] of this.agentViews) if (!ids.has(id)) { this.shimmer.set(view.title, false); view.node.remove(); this.agentViews.delete(id); }
     for (const [index, agent] of agents.entries()) {
       let view = this.agentViews.get(agent.id);
       if (!view) {
         const node = element('details', 'subagent'); node.dataset.subagentId = agent.id;
         node.open = !!threadID && (this.agentOpen.get(threadID)?.has(agent.id) ?? false);
-        const summary = element('summary', 'subagent-summary');
-        const title = element('span', 'subagent-title'), state = element('span', 'subagent-state');
+        const summary = element('summary', 'subagent-summary todo-item');
+        const title = element('span', 'subagent-title todo-content');
+        const text = element('div', 'todo-item-text'); text.append(title);
         const detail = element('div', 'subagent-detail markdown');
-        const chevron = icon('chevron-right'); chevron.classList.add('disclosure-chevron');
-        summary.append(chevron, title, state); node.append(summary, detail);
-        view = { node, title, state, detail }; this.agentViews.set(agent.id, view);
+        summary.append(text); node.append(summary, detail);
+        view = { node, summary, title, detail }; this.agentViews.set(agent.id, view);
       }
       place(this.agentList, view.node, index);
       setText(view.title, agent.title);
+      const status = agentStatuses[agent.status] ?? 'pending';
+      const running = status === 'in_progress';
+      view.summary.dataset.status = status; view.summary.classList.toggle('is-active', running);
+      this.shimmer.set(view.title, running);
       if (agent.messageID) view.node.dataset.messageId = agent.messageID; else delete view.node.dataset.messageId;
-      if (view.state.dataset.status !== agent.status) {
-        view.state.dataset.status = agent.status;
-        view.state.className = `subagent-state ${agent.status}`;
-        view.state.setAttribute('role', 'img'); view.state.setAttribute('aria-label', agent.status);
-        view.state.title = agent.status;
-        view.state.replaceChildren(statusIcon(agent.status));
-      }
+      view.summary.setAttribute('aria-description', agent.status);
+      view.summary.title = agent.status;
       if (view.detail.dataset.value !== agent.detail) {
         view.detail.dataset.value = agent.detail; renderMarkdown(view.detail, agent.detail);
       }
       view.detail.hidden = !agent.detail;
     }
-    setText(this.agentCount, String(agents.length));
     this.agentToggle.title = `Agents · ${agents.length}`; this.agentToggle.setAttribute('aria-label', this.agentToggle.title);
     this.compact = this.main.clientWidth < 880;
     const phases = threadID ? runtime?.todoPhases ?? [] : [];
@@ -157,22 +156,16 @@ export class TodoPanel {
     this.agentTogglePresence.setVisible(hasAgents, instant);
     this.toggle.setAttribute('aria-expanded', String(tasksExpanded));
     this.agentToggle.setAttribute('aria-expanded', String(agentsExpanded));
-    this.main.classList.toggle('has-todos', this.hasTasks || hasAgents);
+    this.main.classList.toggle('has-open-activity', tasksExpanded || agentsExpanded);
     this.main.classList.toggle('todo-compact', this.compact);
   }
   private position(): void {
     if (!this.hasTasks && this.agentViews.size === 0) return;
-    const controlSpace = `${this.controls.offsetWidth + 28}px`;
-    if (this.main.style.getPropertyValue('--todo-control-space') !== controlSpace) this.main.style.setProperty('--todo-control-space', controlSpace);
     const bottom = `${Math.max(12, this.main.getBoundingClientRect().bottom - this.composer.getBoundingClientRect().top + 12)}px`;
     if (this.main.style.getPropertyValue('--todo-bottom') !== bottom) this.main.style.setProperty('--todo-bottom', bottom);
   }
 
   private renderPhases(phases: TodoPhase[]): void {
-    let total = 0, completed = 0;
-    for (const phase of phases) for (const task of phase.tasks) { total++; if (task.status === 'completed') completed++; }
-    setText(this.count, `${completed}/${total}`); setText(this.toggleCount, `${completed}/${total}`);
-    this.toggle.title = `Tasks · ${completed}/${total}`; this.toggle.setAttribute('aria-label', this.toggle.title);
     const active = activeTodo(phases);
     const visiblePhases = phases.filter(phase => phase.tasks.length > 0);
     const phaseKeys = new Set<string>();
@@ -216,9 +209,8 @@ export class TodoPanel {
     const node = element('li', 'todo-item'), text = element('div', 'todo-item-text');
     const content = element('span', 'todo-content'), blocker = element('span', 'todo-blocker muted');
     const detail = element('span', 'todo-detail muted'), notes = element('span', 'todo-notes muted');
-    const status = element('span', 'todo-status'); status.setAttribute('role', 'img'); status.append(icon('circle'));
-    text.append(content, blocker, detail, notes); node.append(status, text);
-    return { node, content, blocker, detail, notes, status };
+    text.append(content, blocker, detail, notes); node.append(text);
+    return { node, content, blocker, detail, notes };
   }
   private updateTask(view: TaskView, task: TodoItem, active: boolean): void {
     view.node.dataset.status = task.status; view.node.classList.toggle('is-active', active);
@@ -228,7 +220,7 @@ export class TodoPanel {
     setText(view.blocker, task.blocker ?? ''); view.blocker.hidden = task.status !== 'blocked' || !task.blocker;
     setText(view.detail, task.details ?? ''); view.detail.hidden = !task.details;
     setText(view.notes, task.notes?.join('\n') ?? ''); view.notes.hidden = !task.notes?.length;
-    view.status.setAttribute('aria-label', statusLabels[task.status]); view.status.title = statusLabels[task.status];
+    view.node.setAttribute('aria-description', statusLabels[task.status]); view.node.title = statusLabels[task.status];
   }
 
   dispose(): void {
@@ -236,7 +228,7 @@ export class TodoPanel {
     this.taskPresence.dispose(); this.agentPresence.dispose(); this.taskTogglePresence.dispose();
     this.agentTogglePresence.dispose();
     this.phaseViews.clear(); this.agentViews.clear(); this.collapsed.clear(); this.agentCollapsed.clear(); this.agentOpen.clear();
-    this.main.classList.remove('has-todos', 'todo-compact');
-    this.main.style.removeProperty('--todo-control-space'); this.main.style.removeProperty('--todo-bottom');
+    this.main.classList.remove('has-open-activity', 'todo-compact');
+    this.main.style.removeProperty('--todo-bottom');
   }
 }

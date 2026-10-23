@@ -63,6 +63,7 @@ function manifestFromJSON(value: unknown): Manifest {
       draft: item.draft === undefined ? '' : text(item.draft, 'draft'), wasRunning: flag(item.wasRunning, false) };
     if (item.lastModel !== undefined && item.lastModel !== null) thread.lastModel = text(item.lastModel, 'model');
     if (item.nativeTitleAttemptedFor !== undefined && item.nativeTitleAttemptedFor !== null) thread.nativeTitleAttemptedFor = text(item.nativeTitleAttemptedFor, 'native title session');
+    if (item.ompSessionFile !== undefined && item.ompSessionFile !== null) thread.ompSessionFile = absolutePath(item.ompSessionFile, 'session file');
     return thread;
   });
   for (const ids of [projects.map(project => project.id.toLowerCase()), threads.map(thread => thread.id.toLowerCase())]) {

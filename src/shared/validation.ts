@@ -66,7 +66,7 @@ export function parseRequest(value: unknown): AppRequest {
     return { path: item.path, status: item.status, originalPath: item.originalPath, additions: item.additions, deletions: item.deletions };
   };
   switch (value.kind) {
-    case 'snapshot': case 'open-project': case 'choose-executable': case 'test-connection': case 'diagnostics': case 'close-context-menu': return { kind: value.kind };
+    case 'snapshot': case 'open-project': case 'choose-executable': case 'test-connection': case 'diagnostics': case 'close-context-menu': case 'get-connections': return { kind: value.kind };
     case 'context-menu': {
       if (!Array.isArray(value.items) || value.items.length === 0 || value.items.length > 32) throw new Error('Choose between 1 and 32 context menu actions.');
       const items: string[] = [];
@@ -77,6 +77,18 @@ export function parseRequest(value: unknown): AppRequest {
       return { kind: value.kind, items };
     }
     case 'add-project': case 'locate-project': case 'reveal-project': return { kind: value.kind, path: text('path') };
+    case 'connect-provider': return { kind: value.kind, providerId: text('providerId'), flowId: text('flowId') };
+    case 'cancel-connection': return { kind: value.kind, flowId: text('flowId') };
+    case 'connection-input': return { kind: value.kind, flowId: text('flowId'), promptId: text('promptId'), value: text('value') };
+    case 'save-provider-key': {
+      const key = text('key').trim();
+      if (!key || key.length > 16384 || /[\r\n]/u.test(key)) throw new Error('Enter a single API key up to 16 KiB.');
+      return { kind: value.kind, providerId: text('providerId'), key };
+    }
+    case 'disconnect-provider': {
+      if (!Number.isSafeInteger(value.credentialId) || typeof value.credentialId !== 'number' || value.credentialId < 0) throw new Error('Choose a stored provider account.');
+      return { kind: value.kind, providerId: text('providerId'), credentialId: value.credentialId };
+    }
     case 'new-thread': return typeof value.projectPath === 'string' ? { kind: value.kind, projectPath: text('projectPath') } : { kind: value.kind };
     case 'select-thread': return typeof value.reopen === 'boolean' ? { kind: value.kind, id: text('id'), reopen: value.reopen } : { kind: value.kind, id: text('id') };
     case 'draft': return { kind: value.kind, id: text('id'), text: text('text') };
@@ -88,7 +100,19 @@ export function parseRequest(value: unknown): AppRequest {
     case 'model': return { kind: value.kind, id: text('id'), modelID: text('modelID') };
     case 'thinking': return { kind: value.kind, id: text('id'), level: text('level') };
     case 'copy-message': return { kind: value.kind, id: text('id'), messageID: text('messageID') };
+    case 'edit-message': return { kind: value.kind, id: text('id'), messageID: text('messageID'), message: text('message') };
     case 'promote-queued': return { kind: value.kind, id: text('id'), message: text('message') };
+    case 'retract-queued': {
+      if (value.queue !== 'steering' && value.queue !== 'followUp') throw new Error('Choose a queued message to edit.');
+      const imageRef = value.imageRef === null ? null : text('imageRef');
+      if (imageRef !== null && (!imageRef || imageRef.length > 200)) throw new Error('Invalid queued image reference.');
+      return { kind: value.kind, id: text('id'), queue: value.queue, message: text('message'), imageRef };
+    }
+    case 'queued-images': {
+      const imageRef = text('imageRef');
+      if (!imageRef || imageRef.length > 200) throw new Error('Invalid queued image reference.');
+      return { kind: value.kind, id: text('id'), imageRef };
+    }
     case 'dialog': return { kind: value.kind, id: text('id'), dialogID: text('dialogID'), fields: fields('fields') };
     case 'rename-thread': return { kind: value.kind, id: text('id'), title: text('title') };
     case 'sidebar': return { kind: value.kind, visible: boolean('visible') };

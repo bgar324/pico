@@ -9,8 +9,10 @@ export class MessageStore {
   private blocks = new Map<string, Map<number, JsonRecord>>();
   private finalized = new Set<string>();
   private owners = new Map<string, string>();
+  private readonly userSources = new Map<string, JsonRecord>();
   private restoring = false;
   constructor(private readonly emitMessage: (message: ChatMessage) => void, private readonly emitTool: (tool: ToolActivity) => void) {}
+  userSource(id: string): JsonRecord | undefined { return this.userSources.get(id); }
 
   consume(frame: JsonRecord): void {
     if (frame.type === 'message_start' || frame.type === 'message_update' || frame.type === 'message_end') this.reduceMessage(frame);
@@ -39,6 +41,7 @@ export class MessageStore {
   restore(history: Json[]): void {
     this.restoring = true;
     this.messages.clear(); this.tools.clear(); this.blocks.clear(); this.finalized.clear(); this.owners.clear();
+    this.userSources.clear();
     try {
       history.forEach((message, index) => this.reduceMessage({ type: 'message_end', messageId: `history-${index}`, message }));
       for (const tool of this.tools.values()) if (tool.state === 'pending' || tool.state === 'running') { tool.state = 'interrupted'; tool.endedAt = Date.now(); }
@@ -73,6 +76,7 @@ export class MessageStore {
     const role = typeof snapshot.role === 'string' ? snapshot.role : existing?.role ?? 'assistant';
     const message: ChatMessage = existing ?? { id, role, text: '', thinking: '', error: null, isStreaming: false, toolIDs: [] };
     this.messages.set(id, message); message.role = role;
+    if (role === 'user' && snapshot.content !== undefined) this.userSources.set(id, snapshot);
     if (typeof snapshot.customType === 'string') message.customType = snapshot.customType;
     if (isRecord(snapshot.details)) message.details = snapshot.details;
     if (typeof snapshot.display === 'boolean') message.display = snapshot.display;
@@ -151,5 +155,7 @@ export class MessageStore {
     const target = argumentsValue.path ?? argumentsValue.file_path ?? argumentsValue.command ?? argumentsValue.query ?? argumentsValue.i;
     tool.target = typeof target === 'string' ? sanitizeDiagnostic(target) : '';
     tool.detail = sanitizeDiagnostic(Object.entries(argumentsValue).sort(([a], [b]) => a.localeCompare(b)).flatMap(([key, value]) => /api.?key|token|password|secret|credential|authorization|^(?:content|data|images)$/i.test(key) || (typeof value !== 'string' && typeof value !== 'number') ? [] : [`${key}: ${sanitizeDiagnostic(String(value))}`]).join('\n'), 65536);
+    if (tool.name === 'write' && typeof argumentsValue.content === 'string') tool.input = argumentsValue.content;
+    else delete tool.input;
   }
 }
