@@ -519,16 +519,14 @@ pre,code { font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace; font-
 .advisor-severity { color:var(--notice-accent); flex-shrink:0; }
 .advisor-group > summary { width:100%; min-height:28px; padding:4px 0; color:var(--muted); font-size:12px; line-height:20px; }
 .main :is(.activity-group,.tool,.advisor-group,.result-source,.notice-rule-details,.subagent) > summary { border-radius:6px; transition:background-color 150ms ease,color 150ms ease; }
-.main :is(.activity-group,.tool,.advisor-group) > summary { column-gap:0; }
+.main :is(.activity-group,.tool,.advisor-group,.notice-rule-details) > summary { column-gap:0; }
 .main :is(.tool,.advisor-group) > summary > .ui-icon:first-child { margin-inline-end:8px; }
-.main :is(.result-source,.notice-rule-details,.subagent) > summary:hover { background:var(--main-hover); color:var(--text); }
-.main :is(.activity-group,.tool,.advisor-group) > summary:is(:hover,:focus-visible) { background:transparent; color:var(--text); }
+.main :is(.result-source,.subagent) > summary:hover { background:var(--main-hover); color:var(--text); }
+.main :is(.activity-group,.tool,.advisor-group,.notice-rule-details) > summary:is(:hover,:focus-visible) { background:transparent; color:var(--text); }
 .main :is(.activity-group,.tool,.advisor-group) > summary:is(:hover,:focus-visible) .work-shimmer { background:none; color:inherit; -webkit-text-fill-color:currentColor; }
 .disclosure-caret { margin-inline-start:.25em; flex-shrink:0; opacity:0; transform:rotate(0deg); transform-origin:center; transition:opacity 140ms ease,transform 180ms var(--main-motion-ease); }
-.main :is(.activity-group,.tool,.advisor-group) > summary:is(:hover,:focus-visible) .disclosure-caret,.main :is(.activity-group,.tool,.advisor-group)[open] > summary .disclosure-caret { opacity:1; }
-.main :is(.activity-group,.tool,.advisor-group)[open] > summary .disclosure-caret { transform:rotate(90deg); }
-.disclosure-chevron { flex-shrink:0; color:var(--muted); transition:transform 180ms var(--main-motion-ease); }
-details[open] > summary > .disclosure-chevron { transform:rotate(90deg); }
+.main :is(.activity-group,.tool,.advisor-group,.notice-rule-details) > summary:is(:hover,:focus-visible) .disclosure-caret,.main :is(.activity-group,.tool,.advisor-group,.notice-rule-details)[open] > summary .disclosure-caret { opacity:1; }
+.main :is(.activity-group,.tool,.advisor-group,.notice-rule-details)[open] > summary .disclosure-caret { transform:rotate(90deg); }
 .advisor-notes { padding-inline-start:24px; }
 .advisor-notes > .advisor-notice { margin:0; padding:12px 0; border:0; border-bottom:1px solid var(--main-divider); border-radius:0; background:transparent; font-size:13px; }
 .advisor-notes > .advisor-notice:last-child { border-bottom:0; }

@@ -82,10 +82,10 @@ function checkNotices(view: Conversation): string[] {
   verify(row(19).textContent?.includes('quoted text') && row(20).textContent?.includes('production deployment is ready'), 'Shell-job filtering altered user or assistant prose.');
   view.showFind(); view.findInput.value = 'Keep useful feedback.'; view.findInput.dispatchEvent(new Event('input'));
   verify(!row(8).querySelector('.result-source'), 'Find reintroduced Advisor source controls.');
-  view.findInput.value = 'reason="rule_violation"'; view.findInput.dispatchEvent(new Event('input'));
-  verify(row(11).querySelector<HTMLDetailsElement>('.result-source')?.open, 'Find did not reveal the matching rule Source message.');
+  view.findInput.value = 'Small, static string-keyed lookup tables'; view.findInput.dispatchEvent(new Event('input'));
+  verify(row(11).querySelector<HTMLDetailsElement>('.notice-rule-details')?.open && !row(11).querySelector('.result-source'), 'Find did not reveal rule instructions or reintroduced the removed source control.');
   view.update({ ...runtime, revision: 2, messages: runtime.messages.map(message => message.id === 'notice-11' ? { ...message, details: { refreshed: true } } : message) }, runtime.id);
-  verify(row(11).querySelector<HTMLDetailsElement>('.result-source')?.open, 'An update collapsed the rule source opened by Find.');
+  verify(row(11).querySelector<HTMLDetailsElement>('.notice-rule-details')?.open, 'An update collapsed rule instructions opened by Find.');
   view.findInput.value = ''; view.findInput.dispatchEvent(new Event('input'));
   store.restore(messages);
   view.update({ ...runtime, revision: 3, messages: structuredClone([...store.messages.values()]) }, runtime.id);
@@ -93,6 +93,7 @@ function checkNotices(view: Conversation): string[] {
   for (const index of [5, 10, 12, 13]) verify(!view.content.querySelector(`[data-message-id="history-${index}"]`), 'Restored task/shell completion leaked into the transcript.');
   verify(view.content.querySelectorAll('[data-message-id="history-18"] .background-result').length === 1 && view.content.querySelector('[data-message-id="history-18"] .background-result')?.textContent?.includes('Useful calculation result'), 'Restored mixed delivery lost its visible Eval result.');
   verify(!view.content.querySelector('[data-message-id="history-8"] .result-source'), 'Restored Advisor source controls leaked.');
+  verify(!view.content.querySelector('[data-message-id="history-11"] .result-source'), 'Restored rule history reintroduced the removed source control.');
   verify(!view.content.querySelector('[data-message-id="history-15"]'), 'Restored incoming IRC delivery leaked into the transcript.');
   return ['Engine notice provenance, hidden task/shell completions in live/restored history, mixed Eval results, literal direct execution, preserved assistant/user content, Advisor notes, and Find disclosure navigation.'];
 }

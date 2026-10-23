@@ -129,35 +129,36 @@ export async function checkMainFrameStates(): Promise<string[]> {
     runtime = { ...runtime, revision: runtime.revision + 1, messages: [
       { id: 'disclosure-owner', role: 'assistant', text: '', thinking: '', toolIDs: [disclosureTool.id], error: null, isStreaming: false },
       { id: 'disclosure-advisor', role: 'custom', customType: 'advisor', text: '', thinking: '', toolIDs: [], error: null, isStreaming: false, details: { notes: [{ note: 'Keep the disclosure state through updates.', severity: 'concern' }] } },
+      { id: 'disclosure-rule', role: 'developer', text: '<system-reminder reason="rule_violation" rule="ts-no-tiny-functions" path="builtin-defaults:ts-no-tiny-functions.md">Keep the rule instructions readable.</system-reminder>', thinking: '', toolIDs: [], error: null, isStreaming: false },
     ], tools: [disclosureTool] };
     view.update(runtime, runtime.id);
-    const disclosures = ['.activity-group', '.tool', '.advisor-group'];
+    const disclosures = ['.activity-group', '.tool', '.advisor-group', '.notice-rule-details'];
     for (const selector of disclosures) {
       const disclosure = view.content.querySelector<HTMLDetailsElement>(selector), control = disclosure?.querySelector('summary');
       if (!disclosure || !control) throw new Error(`Missing disclosure fixture: ${selector}`);
       disclosure.open = false; editor.focus(); await settle();
       const caret = control.querySelector('.disclosure-caret');
       if (!caret) throw new Error(`Missing disclosure indicator: ${selector}`);
-      const name = control.querySelector('.activity-current,.tool-name,.advisor-label');
+      const name = control.querySelector('.activity-current,.tool-name,.advisor-label') ?? control.querySelector(':scope > span');
       const glyph = control.querySelector(':scope > svg:not(.disclosure-caret),:scope > .activity-label > svg');
-      if (!name || !glyph) throw new Error(`Missing preserved icon or label: ${selector}`);
+      if (!name || (!glyph && selector !== '.notice-rule-details')) throw new Error(`Missing preserved icon or label: ${selector}`);
       const fullText = control.querySelector('.activity-current,.advisor-label') ?? control.querySelector('.tool-target:not(:empty)') ?? name;
-      const nameBounds = name.getBoundingClientRect(), textBounds = fullText.getBoundingClientRect(), caretBounds = caret.getBoundingClientRect(), glyphBounds = glyph.getBoundingClientRect();
+      const nameBounds = name.getBoundingClientRect(), textBounds = fullText.getBoundingClientRect(), caretBounds = caret.getBoundingClientRect();
       const textGap = caretBounds.left - textBounds.right;
-      verify(glyphBounds.width === 16 && nameBounds.width > 0 && glyphBounds.right <= nameBounds.left &&
-        textGap > 0 && textGap < 8 && getComputedStyle(glyph).opacity === '1',
-        'The caret was not one compact space after the full row text, or the original icon disappeared.');
+      verify(textGap > 0 && textGap < 8 && nameBounds.width > 0, 'The caret was not one compact space after the full row text.');
+      if (glyph) verify(glyph.getBoundingClientRect().width === 16 && glyph.getBoundingClientRect().right <= nameBounds.left && getComputedStyle(glyph).opacity === '1',
+        'A disclosure lost its original leading icon.');
       verify(getComputedStyle(caret).opacity === '0', 'An idle collapsed row retained its caret.');
       control.click(); editor.focus(); await settle();
       const openAngle = new DOMMatrix(getComputedStyle(caret).transform);
-      verify(disclosure.open && getComputedStyle(caret).opacity === '1' && getComputedStyle(glyph).opacity === '1' && Math.abs(openAngle.a) < .01 && openAngle.b > .99,
+      verify(disclosure.open && getComputedStyle(caret).opacity === '1' && (!glyph || getComputedStyle(glyph).opacity === '1') && Math.abs(openAngle.a) < .01 && openAngle.b > .99,
         'An expanded row lost its downward caret after focus left.');
       control.click(); editor.focus(); await settle();
       verify(!disclosure.open && getComputedStyle(caret).opacity === '0', 'Closing a row did not restore its idle caret behavior.');
       control.click(); await settle();
     }
     runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...disclosureTool, output: 'Updated source results.' }],
-      messages: runtime.messages.map(message => message.customType === 'advisor' ? { ...message, details: { notes: [{ note: 'A higher-severity update.', severity: 'blocker' }] } } : message) };
+      messages: runtime.messages.map(message => message.customType === 'advisor' ? { ...message, details: { notes: [{ note: 'A higher-severity update.', severity: 'blocker' }] } } : message.role === 'developer' ? { ...message, details: { refreshed: true } } : message) };
     view.update(runtime, runtime.id); editor.focus(); await settle();
     for (const selector of disclosures) {
       const disclosure = view.content.querySelector<HTMLDetailsElement>(selector), caret = disclosure?.querySelector('summary .disclosure-caret');
@@ -169,7 +170,7 @@ export async function checkMainFrameStates(): Promise<string[]> {
       'Advisor and task updates preserve unchanged selected prose; agent updates preserve focused disclosures.',
       'Compact panels default closed, reverse safely, and return focus when their data disappears.',
       'Tasks and Agents reserve a lane only while docked and expanded; collapsed, empty, and compact states stay centered, and interrupted thread switches restore opaque panels.',
-      'Activity, tool, and Advisor keep original icons and place carets a small space after the full text; carets persist downward when expanded, hide on collapse, and survive updates.',
+      'Activity, tool, Advisor, and rule-instruction carets follow the full row text, persist downward when expanded, hide on collapse, and survive updates; existing leading icons remain visible.',
     ];
   } finally {
     getSelection()?.removeAllRanges(); panels.dispose(); view.dispose(); host.remove();

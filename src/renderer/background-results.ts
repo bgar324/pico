@@ -247,8 +247,8 @@ function renderRuleNotices(target: HTMLElement, message: ChatMessage, expanded: 
     const instructions = element('details', 'notice-rule-details');
     const key = JSON.stringify([name, path, match.index]);
     instructions.dataset.ruleKey = key; instructions.open = expanded.has(key);
-    const summary = element('summary'), chevron = icon('chevron-right'); chevron.classList.add('disclosure-chevron');
-    summary.append(chevron, element('span', '', 'View rule instructions')); instructions.append(summary);
+    const summary = element('summary');
+    summary.append(element('span', '', 'View rule instructions'), disclosureCaret()); instructions.append(summary);
     appendProse(instructions, match[3] ?? '');
     section.append(instructions);
     target.append(section);
@@ -308,6 +308,6 @@ export function renderBackgroundMessage(target: HTMLElement, message: ChatMessag
       target.append(section);
     }
   }
-  source(target, message, open);
+  if (!rule) source(target, message, open);
   return true;
 }
