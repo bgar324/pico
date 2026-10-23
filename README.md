@@ -141,7 +141,7 @@ Diagnostics stay local, bounded, and sanitized. There is no telemetry. Standard 
 
 ## Development workflow
 
-For each feedback-driven fix, verify the affected behavior, commit the fix, and push it to the repository before reporting completion. Keep unrelated changes out of that commit. A packaged or staged app is not a substitute for a pushed commit; report a push failure as a blocker.
+For each feedback-driven fix, verify the affected behavior, commit the fix, and push it to the repository. Then package, sign, replace the installed app, and relaunch it so the change is visible before reporting completion. Keep unrelated changes out of that commit. Staging a bundle alone is not installation; report push or installation failures as blockers. Quit the old app before replacing its bundle. When Pico hosts the current coding session, use a detached one-shot installer that survives that session's shutdown, waits for all app/helper processes to exit, verifies the replacement, and relaunches it. Do not register a LaunchAgent or login item.
 
 ## Verification
 
