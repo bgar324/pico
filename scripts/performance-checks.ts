@@ -169,6 +169,14 @@ async function checkAdvisorDisclosure(view: Conversation): Promise<string> {
   const response: ChatMessage = { id: 'response-between', role: 'assistant', text: 'Actual conversation output.', thinking: '', error: null, isStreaming: false, toolIDs: [] };
   publishBatch([earlier, response, later]);
   verify(view.content.querySelectorAll('.advisor-group').length === 2, 'Advisor grouping moved feedback across actual conversation output.');
+  await frame();
+  const answer = view.content.querySelector<HTMLElement>('[data-message-id="response-between"] > .markdown > :last-child');
+  const actions = view.content.querySelector<HTMLElement>('[data-response-id="response-between"]');
+  const following = view.content.querySelector<HTMLElement>('[data-message-id="review-second"] .advisor-group > summary');
+  if (!answer || !actions || !following) throw new Error('Missing response-to-Advisor spacing fixture.');
+  const answerBottom = answer.getBoundingClientRect().bottom, actionsBox = actions.getBoundingClientRect(), advisorTop = following.getBoundingClientRect().top;
+  verify(advisorTop - answerBottom <= 36 && actionsBox.top >= answerBottom && advisorTop >= actionsBox.bottom + 8,
+    'Response-to-Advisor spacing stacks excess margins or overlaps the copy control.');
   view.update({ ...source('advisor-deliveries-restored'), messages: structuredClone([earlier, hidden, later]) }, 'advisor-deliveries-restored');
   verify(view.content.querySelectorAll('.advisor-group').length === 1 && view.content.querySelectorAll('.advisor-notice').length === 2 && !view.content.querySelector<HTMLDetailsElement>('.advisor-group')?.open,
     'Restored separate Advisor deliveries did not form one collapsed disclosure.');

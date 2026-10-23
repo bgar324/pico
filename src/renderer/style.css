@@ -540,6 +540,10 @@ details[open] > summary > .disclosure-chevron { transform:rotate(90deg); }
 .message > .markdown[hidden] + .message-images { margin-top:0; }
 .message-actions { display:flex; align-items:center; gap:4px; margin-top:6px; }
 .response-actions { margin:8px 0 0; width:fit-content; }
+/* Advisor follows the response controls without stacking paragraph and turn gaps. */
+.agent-message:has(+ .message .advisor-group) { margin-bottom:8px; }
+.agent-message:has(+ .message .advisor-group) > .markdown > :last-child { margin-bottom:0; }
+.agent-message:has(+ .message .advisor-group) > .response-actions { margin-top:0; }
 .response-actions .copy-message { opacity:0; transition:opacity var(--motion-fast) var(--motion-ease); }
 .agent-message:hover > .response-actions .copy-message,.response-actions:has(.copy-message:focus-visible) .copy-message { opacity:1; }
 @media(hover:none) { .response-actions .copy-message { opacity:1; } }
