@@ -238,7 +238,7 @@ function renderRuleNotices(target: HTMLElement, message: ChatMessage, expanded: 
     appendProse(target, message.text.slice(cursor, match.index));
     const interrupted = match[1] === 'system-interrupt';
     const section = element('section', `transcript-notice rule-notice notice-${interrupted ? 'blocker' : 'concern'}`);
-    section.append(heading('Project rule', interrupted ? 'Interrupted' : 'Review required'));
+    section.append(heading('Project rule', ''));
     const name = attribute(match[2] ?? '', 'rule');
     const path = attribute(match[2] ?? '', 'path');
     if (name) section.append(element('div', 'notice-rule-name', name));
