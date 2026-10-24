@@ -343,7 +343,9 @@ export class ThreadRuntime {
         const result = await this.client.request('promote_queued_message', { message });
         if (generation !== this.generation) return false;
         if (!isRecord(result) || typeof result.promoted !== 'boolean') throw new RpcError('protocol', 'OMP returned an invalid queue promotion result.');
-        await this.refreshState();
+        // Successful promotion emits its authoritative queue_update before the reply.
+        // A full-state read here delays acceptance and every later queue mutation.
+        if (!result.promoted) await this.refreshState();
         if (generation === this.generation) this.changed();
         return result.promoted;
       } finally { this.queueAttachments.finishPromotion(promotion); }

@@ -100,6 +100,8 @@ Queued previews use attachments submitted through Pico in the current runtime. I
 
 OMP matches Steer by text, not attachment ID. A later same-text follow-up's Steer button is disabled when either occurrence has images, until the earlier follow-up moves out of that queue. This prevents promoting a different picture than the one shown.
 
+Steer moves the existing follow-up through OMP's native promotion command without resending it. Successful promotion completes on OMP's acknowledgement and updates the row through its authoritative queue event; Pico does not hold later queue actions behind a post-acceptance full-state read. Acceptance is distinct from delivery to the model: OMP's configured interruption mode still applies, and promotion does not abort a model stream or hard-kill running tools.
+
 The pencil uses OMP's native `remove_queued_message` command, supported by OMP 18.11.2. It is disabled for same-text duplicates in the same queue when any has images, because the native command cannot select attachment IDs. Known attachment-limit conflicts are rejected before withdrawal. If an unexpected native payload cannot fit alongside the current draft, Pico keeps it in memory and offers Restore withdrawn message after space is freed. Keep that window open until recovery is complete.
 
 Retracted images come from the engine's actual queued payload, which OMP may resize or convert before sending. If the native response omits oversized images, Pico uses its retained local copy when available. Any unrecoverable image omission is reported instead of silently presenting a complete draft.

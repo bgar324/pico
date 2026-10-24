@@ -1699,6 +1699,38 @@ test('admitted images that never bind cannot attach to a later equal-text canoni
   assert.deepEqual(queues.reconcile([], ['same']).followUp, [{ text: 'same', imageCount: 0, imageRef: null }]);
 });
 
+test('accepted promotions bypass a held state read and do not delay the next steer', async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime;
+  await r.connect(f.executable);
+  const image: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('First', { images: [image] });
+  await r.sendPrompt('Second');
+  const imageRef = queuedImageRef(r.summary().queuedFollowUps[0]);
+  await r.client.request('hold_next_state');
+  const state = r.refreshState();
+  await heldUsageState(r.client);
+  const accepted = Promise.all([r.promoteQueued('First'), r.promoteQueued('Second')]);
+  try {
+    await waitUntil(() => r.summary().queuedSteers.length === 2);
+    assert.deepEqual(await accepted, [true, true]);
+    const status = await r.client.request('fixture_status');
+    assert.ok(isRecord(status) && status.statePending === true);
+    assert.deepEqual(queueContents(r.summary().queuedSteers), [
+      { text: 'First', imageCount: 1 }, { text: 'Second', imageCount: 0 },
+    ]);
+    assert.equal(r.summary().queuedSteers[0]?.imageRef, imageRef);
+    assert.deepEqual(r.getQueuedImages(imageRef), [image]);
+  } finally {
+    await r.client.request('release_state');
+    await state;
+    await accepted;
+  }
+  assert.deepEqual(r.summary().queuedFollowUps, []);
+  assert.deepEqual(r.summary().queuedSteers.map(entry => entry.text), ['First', 'Second']);
+});
+
 test('queued follow-ups and steers retain submitted image counts, including image-only Send now and canonical delivery', async t => {
   const f = await fixture(t, { history: 'empty', nativeQueues: true });
   const r = f.runtime;
