@@ -13,6 +13,8 @@ import arrowUp from '@tabler/icons/outline/arrow-up.svg';
 import arrowDown from '@tabler/icons/outline/arrow-down.svg';
 import arrowLeft from '@tabler/icons/outline/arrow-left.svg';
 import arrowRight from '@tabler/icons/outline/arrow-right.svg';
+import cornerDownRight from '@tabler/icons/outline/corner-down-right.svg';
+import listDetails from '@tabler/icons/outline/list-details.svg';
 import square from '@tabler/icons/outline/square.svg';
 import dots from '@tabler/icons/outline/dots.svg';
 import copy from '@tabler/icons/outline/copy.svg';
@@ -60,6 +62,7 @@ const icons = {
   folder, 'folder-open': folderOpen, plus, settings,
   'project-folder': projectFolder, 'project-folder-open': projectFolderOpen,
   'arrow-up': arrowUp, 'arrow-down': arrowDown, 'arrow-left': arrowLeft, 'arrow-right': arrowRight,
+  steer: cornerDownRight, queue: listDetails,
   stop: square, more: dots, copy, image: photo, close: x, sliders, model: cpu,
   thinking: brain, context: gauge, 'chevron-right': chevronRight, check,
   inherit: arrowsSort, off: ban, low, medium, high, xhigh: bolt, max: sparkles,

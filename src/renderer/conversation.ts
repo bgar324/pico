@@ -100,8 +100,10 @@ export class Conversation {
     this.backdrop.innerHTML = ompLogo; this.backdrop.hidden = true;
     this.backdrop.setAttribute('role', 'status');
     this.historyLoading.hidden = true; this.historyLoading.setAttribute('role', 'status');
-    this.scroll.append(this.historyLoading, this.content, this.pending);
-    this.node.append(this.backdrop, this.find, this.scroll, this.jump);
+    const transcript = element('div', 'conversation-transcript');
+    this.scroll.append(this.historyLoading, this.content);
+    transcript.append(this.scroll, this.jump);
+    this.node.append(this.backdrop, this.find, transcript, this.pending);
     this.findPresence.setVisible(false, true); this.jumpPresence.setVisible(false, true);
     this.findInput.type = 'search'; this.findInput.placeholder = 'Find in conversation'; this.findInput.setAttribute('aria-label', 'Find in conversation');
     this.findCount.setAttribute('aria-live', 'polite');

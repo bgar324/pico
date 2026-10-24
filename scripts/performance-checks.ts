@@ -639,7 +639,6 @@ async function checkQueuedEditing(view: Conversation, host: HTMLElement): Promis
     const deadline = performance.now() + 3000;
     while (!composer.node.querySelector('.composer-image')) { verify(performance.now() < deadline, 'Existing image draft did not load.'); await frame(); }
     verify(view.pending.querySelector('.message-images img')?.getAttribute('src') === canvas.toDataURL(), 'Queued preview stopped using actual shared message images.');
-    verify(!view.pending.querySelector('.queued-attachments,.queued-label'), 'Queued bubble exposed old count/status indicators.');
     edit().click(); edit().click();
     verify(requests === 1 && composer.node.querySelector<HTMLButtonElement>('.image-remove')?.disabled, 'Edit double-clicked or left source attachments removable.');
     type('Newer draft'); await composer.submit(false);

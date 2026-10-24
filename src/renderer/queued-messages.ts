@@ -1,6 +1,7 @@
 import type { ImageContent, QueuedMessage, RuntimeSnapshot } from '../shared/types';
 import { isImageContent } from '../shared/validation';
-import { button, element, errorText, iconButton, request } from './dom';
+import { element, errorText, iconButton, request } from './dom';
+import { icon } from './icons';
 import { MessageImages } from './message-images';
 
 // Electron supports state-preserving DOM moves, which TS 5.9 does not declare.
@@ -28,14 +29,13 @@ interface QueuedRow {
   error: HTMLElement;
   ambiguous: boolean;
   ambiguousEdit: boolean;
-  editing: boolean;
-  sending: boolean;
+  pendingAction: 'steer' | 'edit' | null;
   alreadySent: boolean;
   decodeFailed: boolean;
 }
 
-const SEND_TITLE = 'Send now. Send into the current run at its next interruption point';
-const AMBIGUOUS_SEND = 'Send the earlier queued message with the same text first. Send now cannot choose between their attachments.';
+const SEND_TITLE = 'Steer the current run at its next interruption point';
+const AMBIGUOUS_SEND = 'Steer the earlier queued message with the same text first. Steer cannot choose between their attachments.';
 const AMBIGUOUS_EDIT = 'Cannot edit messages with the same text while any of them has attachments. Wait for the earlier message to send.';
 
 export class QueuedMessages {
@@ -106,8 +106,10 @@ export class QueuedMessages {
   dispose(): void { this.disposed = true; this.clear(); this.threadID = null; }
 
   private createRow(key: string, entry: QueueEntry): QueuedRow {
-    const node = element('article', 'message user-message queued'); node.dataset.role = 'user'; node.tabIndex = -1;
-    const body = element('div', 'plain-message');
+    const node = element('article', 'queued'); node.tabIndex = -1;
+    const marker = icon('queue'); marker.classList.add('queued-icon');
+    const body = element('div', 'queued-text');
+    const content = element('div', 'queued-content');
     const previewStatus = element('p', 'queued-preview-status muted'); previewStatus.hidden = true;
     const error = element('p', 'error-text'); error.hidden = true; error.setAttribute('role', 'alert');
     const actions = element('div', 'queued-actions');
@@ -117,17 +119,21 @@ export class QueuedMessages {
       if (!this.isLive(row)) return;
       preview.hidden = true; row.decodeFailed = true; this.renderPreview(row);
     });
-    const send = iconButton('arrow-up', 'Send now', () => this.sendNow(row), 'queued-send');
-    const edit = button('Edit', () => this.edit(row), 'queued-edit');
-    const row: QueuedRow = { key, entry, node, body, images, previewStatus, actions, send, edit, error, ambiguous: false, ambiguousEdit: false, editing: false, sending: false, alreadySent: false, decodeFailed: false };
-    actions.append(edit, send); node.append(body, images.node, previewStatus, actions, error);
+    const send = iconButton('steer', 'Steer', () => this.sendNow(row), 'queued-send');
+    send.append(element('span', '', 'Steer'));
+    const edit = iconButton('edit', 'Edit queued message', () => this.edit(row), 'queued-edit');
+    const row: QueuedRow = { key, entry, node, body, images, previewStatus, actions, send, edit, error, ambiguous: false, ambiguousEdit: false, pendingAction: null, alreadySent: false, decodeFailed: false };
+    content.append(body, images.node, previewStatus, error);
+    actions.append(send, edit); node.append(marker, content, actions);
     return row;
   }
 
   private renderRow(row: QueuedRow): void {
     const { entry } = row;
     if (row.body.textContent !== entry.text) row.body.textContent = entry.text;
-    row.body.hidden = !entry.text;
+    row.body.hidden = !entry.text && entry.imageCount === 0;
+    if (!entry.text && entry.imageCount > 0) row.body.textContent = entry.imageCount === 1 ? 'Image' : `${entry.imageCount} images`;
+    row.body.title = entry.text;
     row.node.dataset.queueState = entry.steering ? 'steer' : 'follow-up';
     if (entry.imageRef === null) delete row.node.dataset.imageRef;
     else row.node.dataset.imageRef = entry.imageRef;
@@ -138,11 +144,11 @@ export class QueuedMessages {
     if (hideActions && row.actions.contains(document.activeElement)) row.node.focus({ preventScroll: true });
     row.actions.hidden = hideActions;
     row.send.hidden = entry.steering;
-    row.send.disabled = row.sending || row.editing || row.ambiguous;
+    row.send.disabled = row.pendingAction !== null || row.ambiguous;
     row.send.title = row.ambiguous ? AMBIGUOUS_SEND : SEND_TITLE;
-    row.edit.disabled = row.sending || row.editing || row.ambiguousEdit;
+    row.edit.disabled = row.pendingAction !== null || row.ambiguousEdit;
     row.edit.title = row.ambiguousEdit ? AMBIGUOUS_EDIT : 'Withdraw this message to edit in the composer';
-    row.edit.setAttribute('aria-busy', String(row.editing));
+    row.edit.setAttribute('aria-busy', String(row.pendingAction === 'edit'));
     this.renderPreview(row);
   }
 
@@ -176,8 +182,8 @@ export class QueuedMessages {
 
   private async sendNow(row: QueuedRow): Promise<void> {
     const threadID = this.threadID;
-    if (!threadID || !this.isLive(row) || row.entry.steering || row.sending || row.editing || row.ambiguous || row.alreadySent) return;
-    row.sending = true; row.error.hidden = true; this.renderRow(row);
+    if (!threadID || !this.isLive(row) || row.entry.steering || row.pendingAction !== null || row.ambiguous || row.alreadySent) return;
+    row.pendingAction = 'steer'; row.error.hidden = true; this.renderRow(row);
     try {
       const promoted = await request({ kind: 'promote-queued', id: threadID, message: row.entry.text });
       if (this.threadID !== threadID || !this.isLive(row)) return;
@@ -186,16 +192,16 @@ export class QueuedMessages {
       if (this.threadID !== threadID || !this.isLive(row)) return;
       row.error.textContent = errorText(failure); row.error.hidden = false;
     } finally {
-      if (this.threadID === threadID && this.isLive(row)) { row.sending = false; this.renderRow(row); }
+      if (this.threadID === threadID && this.isLive(row)) { row.pendingAction = null; this.renderRow(row); }
     }
   }
 
   private async edit(row: QueuedRow): Promise<void> {
     const threadID = this.threadID;
     const onEdit = this.onEdit;
-    if (!threadID || !onEdit || !this.isLive(row) || row.editing || row.sending || row.ambiguousEdit || row.alreadySent) return;
+    if (!threadID || !onEdit || !this.isLive(row) || row.pendingAction !== null || row.ambiguousEdit || row.alreadySent) return;
     const preview = row.entry.imageRef === null ? undefined : this.resources.get(row.entry.imageRef)?.state;
-    row.editing = true; row.error.hidden = true; this.renderRow(row);
+    row.pendingAction = 'edit'; row.error.hidden = true; this.renderRow(row);
     try {
       // The canonical queue can remove this row before the mutation response arrives.
       // Restoration belongs to the composer, not to this row's lifetime.
@@ -203,7 +209,7 @@ export class QueuedMessages {
     } catch (failure) {
       if (this.threadID === threadID && this.isLive(row)) { row.error.textContent = errorText(failure); row.error.hidden = false; }
     } finally {
-      if (this.threadID === threadID && this.isLive(row)) { row.editing = false; this.renderRow(row); }
+      if (this.threadID === threadID && this.isLive(row)) { row.pendingAction = null; this.renderRow(row); }
     }
   }
 
