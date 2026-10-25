@@ -152,10 +152,27 @@ export class MessageStore {
   }
   private describe(tool: ToolActivity, argumentsValue: Json | undefined): void {
     if (!isRecord(argumentsValue)) return;
-    const target = argumentsValue.path ?? argumentsValue.file_path ?? argumentsValue.command ?? argumentsValue.query ?? argumentsValue.i;
-    tool.target = typeof target === 'string' ? sanitizeDiagnostic(target) : '';
+    const purpose = [argumentsValue.i, argumentsValue.title].find(value => typeof value === 'string' && value.trim());
+    const target = tool.name === 'eval' ? purpose : argumentsValue.path ?? argumentsValue.file_path ?? argumentsValue.command ?? argumentsValue.query ?? purpose;
+    const patchTarget = tool.name === 'edit' && typeof argumentsValue.input === 'string' ? MessageStore.patchTargets(argumentsValue.input) : '';
+    tool.target = patchTarget || (typeof target === 'string' ? sanitizeDiagnostic(target) : '');
     tool.detail = sanitizeDiagnostic(Object.entries(argumentsValue).sort(([a], [b]) => a.localeCompare(b)).flatMap(([key, value]) => /api.?key|token|password|secret|credential|authorization|^(?:content|data|images)$/i.test(key) || (typeof value !== 'string' && typeof value !== 'number') ? [] : [`${key}: ${sanitizeDiagnostic(String(value))}`]).join('\n'), 65536);
     if (tool.name === 'write' && typeof argumentsValue.content === 'string') tool.input = argumentsValue.content;
     else delete tool.input;
+  }
+  private static patchTargets(patch: string): string {
+    if (!/^\*\*\* Begin Patch\r?\n/.test(patch)) return '';
+    const paths = new Set<string>();
+    const end = patch.indexOf('\n*** End Patch');
+    let hasFile = false;
+    // Only patch control lines identify files; source lines and incomplete headers do not.
+    for (const match of patch.matchAll(/^\[([^#\r\n]+)#[0-9A-Fa-f]{4}\]\r?$|^MV (?:"([^"\r\n]+)"|([^"\r\n]+))\r?$/gm)) {
+      if (end >= 0 && match.index > end) break;
+      if (match[1] !== undefined) hasFile = true;
+      else if (!hasFile) continue;
+      const path = match[1] ?? match[2] ?? match[3];
+      if (path) paths.add(sanitizeDiagnostic(path, path.length));
+    }
+    return [...paths].join(', ');
   }
 }

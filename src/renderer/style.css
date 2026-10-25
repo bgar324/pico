@@ -254,8 +254,10 @@ pre,code { font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace; font-
 .tool { font-size:12px; line-height:20px; margin:2px 0; color:var(--muted); }
 .tool > summary { align-items:center; gap:8px; min-height:28px; padding:4px 0; }
 .tool-name { color:inherit; }
+.tool-purpose { min-width:0; overflow-wrap:anywhere; }
 .tool-target { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; flex:0 1 auto; font:inherit; }
 .tool-target:not(:empty) { margin-inline-start:.25em; }
+.tool-files .tool-target { overflow:visible; white-space:normal; overflow-wrap:anywhere; }
 .tool-block { position:relative; margin:6px 0; background:var(--main-panel-surface); border:1px solid var(--main-divider); border-radius:8px; overflow:hidden; }
 .tool-block pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:360px; overflow:auto; padding:12px; margin:0; background:transparent; user-select:text; }
 .jump-latest { position:absolute; bottom:12px; left:50%; transform:translateX(-50%); z-index:2; width:32px; min-width:32px; height:32px; min-height:32px; padding:7px; border-radius:50%; background:var(--main-panel-surface); border-color:var(--main-divider); box-shadow:0 2px 8px #0002; }

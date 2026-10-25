@@ -17,6 +17,7 @@ import ompLogo from './omp-logo.svg';
 interface MessageView { node: HTMLElement; body: HTMLElement; images: MessageImages; reasoning: HTMLElement; error: HTMLElement; value: ChatMessage; advisors: readonly ChatMessage[] | undefined }
 interface ToolView { node: HTMLDetailsElement; summary: HTMLElement; detail: HTMLElement; input: HTMLElement; output: HTMLElement; value: ToolActivity }
 interface ActivityView { node: HTMLDetailsElement; label: HTMLElement; current: HTMLElement; state: HTMLElement | null; list: HTMLElement }
+const FILE_TOOLS: Record<string, true | undefined> = { read: true, write: true, edit: true, glob: true, grep: true };
 
 function createActivityView(): ActivityView {
   const node = element('details', 'activity-group'), summary = element('summary', 'activity-summary');
@@ -28,8 +29,14 @@ function createActivityView(): ActivityView {
 }
 
 function toolLabel(name: string): string {
+  if (name === 'eval') return 'Run code';
   const text = name.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_-]/g, ' ').toLocaleLowerCase();
   return text.charAt(0).toLocaleUpperCase() + text.slice(1);
+}
+
+function toolAction(tool: ToolActivity): string {
+  if (tool.name === 'eval') return tool.target.trim() || toolLabel(tool.name);
+  return `${toolLabel(tool.name)}${tool.target ? ` ${tool.target}` : ''}`;
 }
 
 function toolOnlyMessage(message: ChatMessage): boolean {
@@ -359,10 +366,10 @@ export class Conversation {
         }
         if (!group.state.parentElement) group.label.parentElement?.append(group.state);
       } else group.state?.remove();
-      const status = running ? `Running · ${toolLabel(running.name)} ${running.target}` : failed ? 'Activity ended' : interrupted ? 'Interrupted' : 'Completed';
+      const status = running ? `Running · ${toolAction(running)}` : failed ? 'Activity ended' : interrupted ? 'Interrupted' : 'Completed';
       group.label.parentElement?.setAttribute('aria-description', status);
       group.current.hidden = !shown;
-      const currentAction = shown ? `${toolLabel(shown.name)}${shown.target ? ` ${shown.target}` : ''}` : '';
+      const currentAction = shown ? toolAction(shown) : '';
       if (group.current.textContent !== currentAction) group.current.textContent = currentAction;
       this.shimmer.set(group.current, !!running);
       group.current.title = currentAction;
@@ -509,10 +516,11 @@ export class Conversation {
       host.append(view.node);
     }
     if (view.value !== tool || !view.summary.textContent) {
+      view.node.classList.toggle('tool-files', FILE_TOOLS[tool.name] === true);
       const duration = tool.endedAt === null ? null : Math.max(0, (tool.endedAt - tool.startedAt) / 1000);
       view.summary.title = duration !== null && duration >= 1 ? `Duration: ${duration.toFixed(1)}s` : '';
       view.summary.setAttribute('aria-description', tool.state);
-      view.summary.replaceChildren(toolIcon(tool.name), element('span', 'tool-name', toolLabel(tool.name)), element('span', 'tool-target', tool.target), disclosureCaret());
+      view.summary.replaceChildren(toolIcon(tool.name), element('span', tool.name === 'eval' ? 'tool-name tool-purpose' : 'tool-name', tool.name === 'eval' ? toolAction(tool) : toolLabel(tool.name)), element('span', 'tool-target', tool.name === 'eval' ? '' : tool.target), disclosureCaret());
       if (view.detail.textContent !== tool.detail) {
         const existing = view.detail.firstChild;
         if (existing instanceof Text && tool.detail.startsWith(existing.data)) existing.appendData(tool.detail.slice(existing.length));

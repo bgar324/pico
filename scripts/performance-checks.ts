@@ -256,18 +256,20 @@ function checkActivityPresentation(view: Conversation): string {
   const fallback = toolIcon('unknown-custom-tool').innerHTML;
   verify(new Set(glyphs).size === observedTools.length && glyphs.every(glyph => glyph !== fallback), 'Observed native tools lost their distinct tool glyphs.');
   const store = new MessageStore(() => {}, () => {});
-  store.consume({ type: 'tool_execution_start', toolCallId: 'eval', toolName: 'eval', args: { i: 'Inspecting renderer state' } });
+  store.consume({ type: 'tool_execution_start', toolCallId: 'eval', toolName: 'eval', args: { language: 'js', code: 'document.title', title: 'Inspecting renderer state', timeout: 30, reset: false } });
   let runtime = { ...source('activity-preview'), messages: structuredClone([...store.messages.values()]), tools: structuredClone([...store.tools.values()]) };
   view.update(runtime, runtime.id);
   const evalNode = view.content.querySelector<HTMLDetailsElement>('[data-tool-id="eval"]');
   const orphanGroup = evalNode?.closest<HTMLDetailsElement>('.activity-group');
   verify(orphanGroup && !orphanGroup.open && !view.content.querySelector(':scope > .tool'), 'An orphan Eval tool leaked outside collapsed Activity.');
   if (!orphanGroup || !evalNode) throw new Error('Missing Eval activity.');
+  verify(evalNode.querySelector('.tool-name')?.textContent === 'Inspecting renderer state' && !evalNode.querySelector('.tool-target')?.textContent && orphanGroup.querySelector('.activity-current')?.textContent === 'Inspecting renderer state', 'Eval purpose was missing or prefixed with the tool name.');
+  verify(orphanGroup.querySelector('summary')?.getAttribute('aria-description') === 'Running · Inspecting renderer state', 'Eval purpose was missing from its accessible running announcement.');
   orphanGroup.open = true; evalNode.open = true;
   const owner = { role: 'assistant', content: [
     { type: 'thinking', thinking: 'Keep the explanation readable.' }, { type: 'text', text: 'I am checking the project.' },
     { type: 'toolCall', id: 'ask', name: 'ask', arguments: {} },
-    { type: 'toolCall', id: 'eval', name: 'eval', arguments: { i: 'Inspecting renderer state' } },
+    { type: 'toolCall', id: 'eval', name: 'eval', arguments: { language: 'js', code: 'document.title', title: 'Inspecting renderer state', timeout: 30, reset: false } },
     { type: 'toolCall', id: 'bash', name: 'bash', arguments: { command: 'npm run typecheck && npm test' } },
   ] };
   store.consume({ type: 'message_end', messageId: 'owner', message: owner });
@@ -290,6 +292,70 @@ function checkActivityPresentation(view: Conversation): string {
   view.update({ ...runtime, revision: 4, tools: [...store.tools.values()].map<ToolActivity>(tool => tool.id === 'eval' ? { ...tool, state: 'interrupted' } : tool) }, runtime.id);
   verify(group.querySelector('.activity-summary')?.getAttribute('aria-description') === 'Interrupted' && evalNode.querySelector('summary')?.getAttribute('aria-description') === 'interrupted', 'Interrupted activity lost its accessible status.');
   return 'Ask/Eval and orphan tools stay in Activity; live commands shimmer and completed rounds retain a static latest action.';
+}
+
+async function checkToolLabels(view: Conversation): Promise<string> {
+  const paths = ['src/renderer/conversation.ts', 'scripts/performance-checks.ts'];
+  const patch = `*** Begin Patch\n[${paths[0]}#A1B2]\nPUT 1.=1:\n+first\n[${paths[1]}#C3D4]\nPUT 1.=1:\n+second\n*** End Patch\n`;
+  const evalArgs = { language: 'js', code: '1 + 1', title: 'Inspecting tool filenames', timeout: 30, reset: false };
+  const store = new MessageStore(() => {}, () => {});
+  store.consume({ type: 'tool_execution_start', toolCallId: 'label-edit', toolName: 'edit', args: { input: patch } });
+  store.consume({ type: 'tool_execution_start', toolCallId: 'label-eval', toolName: 'eval', args: evalArgs });
+  const fileTool = (name: string, target: string): ToolActivity => ({ id: `label-${name}`, name, target, detail: '', output: '', state: 'succeeded', startedAt: 1, endedAt: 2 });
+  const extraTools = [fileTool('read', 'src/shared/types.ts'), fileTool('write', 'generated/report.json'), fileTool('glob', 'src/renderer/**/*.ts'), fileTool('grep', 'src/main/main.ts'), fileTool('bash', 'npm run typecheck && npm test && npm run build'), { ...fileTool('eval', ''), id: 'label-fallback' }];
+  let runtime: RuntimeSnapshot = { ...source('tool-labels'), messages: [], tools: [...structuredClone([...store.tools.values()]), ...extraTools] };
+  view.update(runtime, runtime.id);
+  const edit = view.content.querySelector<HTMLDetailsElement>('[data-tool-id="label-edit"]');
+  const group = edit?.closest<HTMLDetailsElement>('.activity-group');
+  const evaluation = view.content.querySelector<HTMLDetailsElement>('[data-tool-id="label-eval"]');
+  if (!edit || !group || !evaluation) throw new Error('Missing tool label fixtures.');
+  verify(view.content.querySelector('[data-tool-id="label-fallback"] .tool-name')?.textContent === 'Run code', 'Eval without a purpose retained a bare tool name.');
+  group.open = true; edit.open = true; evaluation.open = true;
+  const assertFiles = (): void => {
+    for (const tool of runtime.tools.filter(tool => ['read', 'write', 'edit', 'glob', 'grep'].includes(tool.name))) {
+      const target = view.content.querySelector<HTMLElement>(`[data-tool-id="${tool.id}"] > summary > .tool-target`);
+      verify(target?.checkVisibility() && target.innerText === tool.target && getComputedStyle(target).whiteSpace === 'normal', `${tool.name} hid its file context.`);
+    }
+  };
+  assertFiles();
+  view.node.style.width = '320px';
+  try {
+    await frame();
+    const target = edit.querySelector<HTMLElement>('summary > .tool-target'), shell = view.content.querySelector<HTMLElement>('[data-tool-id="label-bash"] .tool-target');
+    const text = target?.firstChild;
+    if (!target || !(text instanceof Text) || !shell) throw new Error('Missing narrow filename target.');
+    verify(target.scrollWidth <= target.clientWidth + 1 && target.getBoundingClientRect().height > 20, 'Multi-file Edit target clipped later filenames rather than wrapping.');
+    const bounds = target.getBoundingClientRect(), range = document.createRange();
+    for (const path of paths) {
+      const filename = path.slice(path.lastIndexOf('/') + 1), start = text.data.indexOf(filename);
+      verify(start >= 0, `Edit omitted ${filename}.`);
+      range.setStart(text, start); range.setEnd(text, start + filename.length);
+      verify([...range.getClientRects()].every(rect => rect.width > 0 && rect.left >= bounds.left - 1 && rect.right <= bounds.right + 1), `Edit clipped ${filename}.`);
+    }
+    verify(getComputedStyle(shell).whiteSpace === 'nowrap', 'Filename wrapping expanded shell commands into giant rows.');
+  } finally { view.node.style.removeProperty('width'); }
+  group.open = false; edit.open = false;
+  view.findInput.value = paths[1] ?? ''; view.findInput.dispatchEvent(new Event('input'));
+  verify(group.open && edit.open && edit.classList.contains('find-match'), 'Find did not reveal a filename inside a multi-file Edit.');
+  view.findInput.value = evalArgs.title; view.findInput.dispatchEvent(new Event('input'));
+  verify(evaluation.open && evaluation.classList.contains('find-match'), 'Find stopped matching Eval purpose labels.');
+  view.findInput.value = ''; view.findInput.dispatchEvent(new Event('input'));
+  const summary = evaluation.querySelector('summary'); summary?.focus();
+  runtime = { ...runtime, revision: 2, tools: runtime.tools.map(tool => tool.id === 'label-eval' ? { ...tool, target: 'Comparing renderer filenames' } : tool) };
+  view.update(runtime, runtime.id);
+  verify(evaluation.querySelector('summary') === summary && document.activeElement === summary && evaluation.open && group.open && summary?.querySelector('.tool-name')?.textContent === 'Comparing renderer filenames', 'Purpose updates replaced focused disclosures or retained stale labels.');
+  store.restore([{ role: 'assistant', content: [{ type: 'toolCall', id: 'label-edit', name: 'edit', arguments: { input: patch } }, { type: 'toolCall', id: 'label-eval', name: 'eval', arguments: evalArgs }] }]);
+  runtime = { ...source('tool-labels-restored'), messages: structuredClone([...store.messages.values()]), tools: structuredClone([...store.tools.values()]) };
+  view.update(runtime, runtime.id);
+  const restored = view.content.querySelector<HTMLDetailsElement>('[data-tool-id="label-edit"]'), restoredGroup = restored?.closest<HTMLDetailsElement>('.activity-group');
+  verify(restored && restoredGroup && !restored.open && !restoredGroup.open && view.content.querySelector('[data-tool-id="label-eval"] .tool-name')?.textContent === evalArgs.title, 'Restored tool history lost purpose labels or started expanded.');
+  if (!restored || !restoredGroup) throw new Error('Missing restored tool labels.');
+  restoredGroup.open = true; restored.open = true; assertFiles();
+  runtime = { ...runtime, revision: 2, tools: runtime.tools.map(tool => tool.id === 'label-edit' ? { ...tool, target: `${tool.target}, src/renderer/icons.ts`, state: 'succeeded' } : tool.id === 'label-eval' ? { ...tool, target: 'Comparing restored labels' } : tool) };
+  view.update(runtime, runtime.id);
+  verify(view.content.querySelector('[data-tool-id="label-edit"]') === restored && restored.open && restoredGroup.open && restored.querySelector('summary')?.textContent?.includes('src/renderer/icons.ts') && restored.querySelector('summary')?.getAttribute('aria-description') === 'succeeded', 'Restored Edit updates lost filenames, state, or disclosure identity.');
+  verify(view.content.querySelector('[data-tool-id="label-eval"] .tool-name')?.textContent === 'Comparing restored labels', 'Restored Eval updates kept a stale purpose.');
+  return 'Native Eval titles replace bare tool names; all file rows retain targets, multi-file Edit filenames wrap at narrow widths, Find reveals purpose/files, and live/restored updates preserve disclosures, focus, and accessible state.';
 }
 async function checkShimmerSpeed(view: Conversation, host: HTMLElement): Promise<string> {
   const composer = document.createElement('div');
@@ -736,6 +802,7 @@ export async function checkLoadingBehavior(): Promise<string[]> {
     outcomes.push(await checkAdvisorDisclosure(view));
     outcomes.push(checkTodoActivity(view));
     outcomes.push(checkActivityPresentation(view));
+    outcomes.push(await checkToolLabels(view));
     outcomes.push(await checkTranscriptSpacing(view));
     outcomes.push(await checkShimmerSpeed(view, host));
     outcomes.push(await checkWorkFeedback(view));
