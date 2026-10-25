@@ -238,12 +238,9 @@ function renderRuleNotices(target: HTMLElement, message: ChatMessage, expanded: 
     appendProse(target, message.text.slice(cursor, match.index));
     const interrupted = match[1] === 'system-interrupt';
     const section = element('section', `transcript-notice rule-notice notice-${interrupted ? 'blocker' : 'concern'}`);
-    section.append(heading('Project rule', ''));
     const name = attribute(match[2] ?? '', 'rule');
     const path = attribute(match[2] ?? '', 'path');
-    if (name) section.append(element('div', 'notice-rule-name', name));
-    if (path) section.append(element('code', 'notice-rule-path', path));
-    section.append(element('p', 'notice-explanation muted', interrupted ? 'OMP interrupted the agent because a project rule matched.' : 'A project rule matched. The agent must review its instructions.'));
+    section.append(heading(name ? `Project rule: ${name}` : 'Project rule', ''));
     const instructions = element('details', 'notice-rule-details');
     const key = JSON.stringify([name, path, match.index]);
     instructions.dataset.ruleKey = key; instructions.open = expanded.has(key);

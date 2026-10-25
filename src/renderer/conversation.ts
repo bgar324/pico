@@ -570,7 +570,7 @@ export class Conversation {
     if (!hit) return;
     if (hit instanceof HTMLDetailsElement) hit.open = true;
     const needle = this.query.toLocaleLowerCase();
-    const candidates = Array.from(hit.querySelectorAll<HTMLElement>('.tool-detail,.tool-input,.tool-output,.result-raw,.result-metadata,.markdown :is(p,li,pre,h1,h2,h3,h4,h5,h6,dt,dd,td,th),.result-fields dt,.result-fields dd,.result-title,.notice-explanation,.notice-rule-name,.notice-rule-path'));
+    const candidates = Array.from(hit.querySelectorAll<HTMLElement>('.tool-detail,.tool-input,.tool-output,.result-raw,.result-metadata,.markdown :is(p,li,pre,h1,h2,h3,h4,h5,h6,dt,dd,td,th),.result-fields dt,.result-fields dd,.result-title'));
     const visibleMatch = hit.checkVisibility() && hit.innerText.toLocaleLowerCase().includes(needle);
     const target = candidates.find(node => node.checkVisibility() && node.innerText.toLocaleLowerCase().includes(needle))
       ?? (visibleMatch ? hit : candidates.find(node => (node.textContent ?? '').toLocaleLowerCase().includes(needle)) ?? hit);

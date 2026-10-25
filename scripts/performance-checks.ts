@@ -72,7 +72,7 @@ function checkNotices(view: Conversation): string[] {
   verify(row(8).querySelector('.notice-concern')?.textContent?.includes('Keep useful feedback.') && !row(8).querySelector(':scope > .markdown > .result-prose') && !row(8).querySelector('.result-source'), 'Advisor content lost its note or retained source clutter.');
   verify(row(9).textContent?.includes('Visible extension status'), 'Visible extension content was hidden.');
   verify(!view.content.querySelector('[data-message-id="notice-10"]'), 'Batched shell completions created transcript cards.');
-  verify(row(11).querySelector('.notice-rule-name')?.textContent === 'ts-set-map' && row(11).querySelector('.notice-rule-path')?.textContent === 'builtin-defaults:ts-set-map.md' && !row(11).querySelector<HTMLDetailsElement>('.notice-rule-details')?.open, 'Developer rule reminder lost its compact rule presentation.');
+  verify(row(11).querySelector('.result-title')?.textContent === 'Project rule: ts-set-map' && !row(11).querySelector('.notice-rule-name,.notice-rule-path,.notice-explanation') && !row(11).querySelector<HTMLDetailsElement>('.notice-rule-details')?.open, 'Developer rule reminder lost its compact rule presentation.');
   verify(!view.content.querySelector('[data-message-id="notice-12"]'), 'Agent completion dump leaked into the transcript.');
   verify(!view.content.querySelector('[data-message-id="notice-13"]'), 'A task/shell-only delivery created a transcript card.');
   verify(!view.content.querySelector('[data-message-id="notice-15"]'), 'Internal incoming IRC delivery leaked into the transcript.');

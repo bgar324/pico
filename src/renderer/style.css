@@ -543,8 +543,6 @@ pre,code { font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace; font-
 .advisor-notes { padding-inline-start:24px; }
 .advisor-notes > .advisor-notice { margin:0; padding:12px 0; border:0; border-bottom:1px solid var(--main-divider); border-radius:0; background:transparent; font-size:13px; }
 .advisor-notes > .advisor-notice:last-child { border-bottom:0; }
-.notice-rule-name { margin:0 0 4px; font-size:12px; font-weight:550; overflow-wrap:anywhere; }
-.notice-rule-path { display:block; margin:0 0 8px; color:var(--muted); font-size:11px; white-space:pre-wrap; overflow-wrap:anywhere; }
 .message-images { display:grid; gap:8px; margin-top:8px; max-width:100%; }
 .message-image-open { display:block; width:fit-content; max-width:min(100%,420px); min-width:0; min-height:0; padding:0; border:0; border-radius:8px; background:transparent; cursor:zoom-in; }
 .message-image-open:hover:not(:disabled) { background:transparent; }
@@ -559,7 +557,6 @@ pre,code { font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace; font-
 .message-actions .copy-message:hover { color:var(--text); }
 .result-console { position:relative; margin:10px 0 0; padding:12px; max-height:300px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; background:var(--control); border-radius:var(--control-radius); line-height:1.55; user-select:text; }
 .result-console > code { padding:0; background:none; font:inherit; }
-.notice-explanation { margin:0 0 6px; font-size:12px; line-height:1.5; }
 .notice-rule-details > summary { min-height:28px; font-size:12px; color:var(--muted); }
 .notice-rule-details[open] > summary { margin-bottom:8px; }
 /* Keep closing content out of native Tab order while its visual exit is still running. */
