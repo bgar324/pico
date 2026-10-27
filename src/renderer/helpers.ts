@@ -31,7 +31,7 @@ function isMessage(value: unknown): value is ChatMessage {
   return isRecord(value) && typeof value.id === 'string' && typeof value.role === 'string' && typeof value.text === 'string' && typeof value.thinking === 'string' && (value.error === null || typeof value.error === 'string') && typeof value.isStreaming === 'boolean' && Array.isArray(value.toolIDs) && value.toolIDs.every(id => typeof id === 'string');
 }
 function isTool(value: unknown): value is ToolActivity {
-  return isRecord(value) && typeof value.id === 'string' && typeof value.name === 'string' && typeof value.target === 'string' && typeof value.detail === 'string' && (value.input === undefined || typeof value.input === 'string') && typeof value.output === 'string' && ['pending', 'running', 'succeeded', 'failed', 'interrupted'].includes(String(value.state)) && typeof value.startedAt === 'number' && (value.endedAt === null || typeof value.endedAt === 'number');
+  return isRecord(value) && typeof value.id === 'string' && typeof value.name === 'string' && typeof value.target === 'string' && (value.paths === undefined || (Array.isArray(value.paths) && value.paths.every(path => typeof path === 'string'))) && typeof value.detail === 'string' && (value.input === undefined || typeof value.input === 'string') && typeof value.output === 'string' && ['pending', 'running', 'succeeded', 'failed', 'interrupted'].includes(String(value.state)) && typeof value.startedAt === 'number' && (value.endedAt === null || typeof value.endedAt === 'number');
 }
 function isWorkPeriods(value: unknown): boolean {
   if (!Array.isArray(value) || value.length > 32) return false;

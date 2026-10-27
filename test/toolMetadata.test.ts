@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { MessageStore } from '../src/omp/MessageStore';
-import type { JsonRecord } from '../src/shared/types';
+import type { JsonRecord, ToolActivity } from '../src/shared/types';
 
 const patch = '*** Begin Patch\n[src/first.ts#A1B2]\nPUT 1.=1:\n+first\n[src/second.ts#C3D4]\nPUT 1.=1:\n+second\n*** End Patch\n';
 const call = (id: string, name: string, args: JsonRecord): JsonRecord => ({ type: 'toolCall', id, name, arguments: args });
@@ -11,6 +11,7 @@ test('Edit extracts all file headers from the installed OMP input object shape',
   const messages = store();
   messages.consume({ type: 'tool_execution_start', toolCallId: 'edit', toolName: 'edit', args: { input: patch } });
   assert.equal(messages.tools.get('edit')?.target, 'src/first.ts, src/second.ts');
+  assert.deepEqual(messages.tools.get('edit')?.paths, ['src/first.ts', 'src/second.ts']);
   assert.equal(messages.tools.get('edit')?.input, undefined);
 });
 
@@ -19,20 +20,59 @@ test('Edit partial snapshots wait for complete headers, grow and accept canonica
   const partial = (input: string) => messages.consume({ type: 'message_update', messageId: 'reply', assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 0, delta: '', partial: { role: 'assistant', content: [call('edit', 'edit', { input })] } } });
   partial('*** Begin Patch\n[src/first.ts#A1');
   assert.equal(messages.tools.get('edit')?.target, '');
+  assert.equal(messages.tools.get('edit')?.paths, undefined);
   partial('*** Begin Patch\n[src/first.ts#A1B2]\nPUT 1.=1:\n+first\n[src/sec');
   assert.equal(messages.tools.get('edit')?.target, 'src/first.ts');
+  assert.deepEqual(messages.tools.get('edit')?.paths, ['src/first.ts']);
   partial(patch);
   assert.equal(messages.tools.get('edit')?.target, 'src/first.ts, src/second.ts');
+  assert.deepEqual(messages.tools.get('edit')?.paths, ['src/first.ts', 'src/second.ts']);
   messages.consume({ type: 'message_end', messageId: 'reply', message: { role: 'assistant', content: [call('edit', 'edit', { input: '*** Begin Patch\n[src/corrected.ts#E5F6]\nREM\n*** End Patch\n' })] } });
   assert.equal(messages.tools.get('edit')?.target, 'src/corrected.ts');
+  assert.deepEqual(messages.tools.get('edit')?.paths, ['src/corrected.ts']);
 });
 
 test('Edit restored history retains all targets and completed state', () => {
   const messages = store();
   messages.restore([{ role: 'assistant', content: [call('edit', 'edit', { input: patch })] }, { role: 'toolResult', toolCallId: 'edit', toolName: 'edit', content: [{ type: 'text', text: 'Applied patch' }] }]);
   assert.equal(messages.tools.get('edit')?.target, 'src/first.ts, src/second.ts');
+  assert.deepEqual(messages.tools.get('edit')?.paths, ['src/first.ts', 'src/second.ts']);
   assert.equal(messages.tools.get('edit')?.state, 'succeeded');
   assert.deepEqual(messages.messages.get('history-0')?.toolIDs, ['edit']);
+});
+
+test('Edit live events and restored history retain comma-containing filenames and rename destinations as distinct paths', () => {
+  const input = '*** Begin Patch\n[src/first, original.ts#A1B2]\nMV "src/first, renamed.ts"\n[src/second.ts#C3D4]\nREM\n*** End Patch\n';
+  const paths = ['src/first, original.ts', 'src/first, renamed.ts', 'src/second.ts'];
+  const emitted: ToolActivity[] = [];
+  const messages = new MessageStore(() => {}, tool => emitted.push(structuredClone(tool)));
+  const assistant = { role: 'assistant', content: [call('edit', 'edit', { input })] };
+  messages.consume({ type: 'message_update', messageId: 'reply', assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 0, partial: assistant } });
+  assert.deepEqual(emitted.at(-1)?.paths, paths);
+  messages.consume({ type: 'tool_execution_start', toolCallId: 'edit', toolName: 'edit', args: { input } });
+  assert.deepEqual(emitted.at(-1)?.paths, paths);
+  assert.equal(emitted.at(-1)?.target, paths.join(', '));
+  messages.restore([assistant, { role: 'toolResult', toolCallId: 'edit', toolName: 'edit', content: [{ type: 'text', text: 'Applied patch' }] }]);
+  assert.deepEqual(messages.tools.get('edit')?.paths, paths);
+  assert.equal(messages.tools.get('edit')?.target, paths.join(', '));
+  assert.equal(messages.tools.get('edit')?.state, 'succeeded');
+});
+
+test('Canonical non-patch corrections clear paths without deriving files from purpose or input lines', () => {
+  const corrections: JsonRecord[] = [
+    call('edit', 'edit', { i: 'Editing src/purpose.ts', input: 'src/not-a-header.ts\nMV src/not-a-patch.ts' }),
+    call('edit', 'edit', { input: '*** Begin Patch\n[src/incomplete.ts#A1' }),
+    call('edit', 'edit', { path: 'src/legacy.ts', oldText: 'before', newText: 'after' }),
+    call('edit', 'write', { path: 'src/write.ts', content: patch }),
+    { type: 'toolCall', id: 'edit', name: 'edit', arguments: null },
+  ];
+  for (const correction of corrections) {
+    const messages = store();
+    messages.consume({ type: 'message_update', messageId: 'reply', assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 0, partial: { role: 'assistant', content: [call('edit', 'edit', { input: patch })] } } });
+    assert.deepEqual(messages.tools.get('edit')?.paths, ['src/first.ts', 'src/second.ts']);
+    messages.consume({ type: 'message_end', messageId: 'reply', message: { role: 'assistant', content: [correction] } });
+    assert.equal(messages.tools.get('edit')?.paths, undefined);
+  }
 });
 
 test('Edit includes rename destinations once and ignores source text and incomplete controls', () => {
@@ -40,8 +80,10 @@ test('Edit includes rename destinations once and ignores source text and incompl
   const input = '*** Begin Patch\r\n[src/first.ts#A1B2]\r\nPUT 1.=1:\r\n+[src/not-a-target.ts#AAAA]\r\n+MV src/not-a-destination.ts\r\nMV "src/renamed file.ts"\r\n[src/first.ts#A1B2]\r\nMV src/final.ts\r\n[src/incomplete.ts#A1\r\n*** End Patch\r\n[src/outside.ts#AAAA]\r\n';
   messages.consume({ type: 'tool_execution_start', toolCallId: 'edit', toolName: 'edit', args: { input } });
   assert.equal(messages.tools.get('edit')?.target, 'src/first.ts, src/renamed file.ts, src/final.ts');
+  assert.deepEqual(messages.tools.get('edit')?.paths, ['src/first.ts', 'src/renamed file.ts', 'src/final.ts']);
   messages.consume({ type: 'tool_execution_start', toolCallId: 'not-patch', toolName: 'edit', args: { input: '[src/not-a-patch.ts#AAAA]\nMV src/not-a-patch-either.ts' } });
   assert.equal(messages.tools.get('not-patch')?.target, '');
+  assert.equal(messages.tools.get('not-patch')?.paths, undefined);
 });
 
 test('Edit preserves the full multi-file target list and redacts sensitive diagnostic metadata', () => {
@@ -50,6 +92,7 @@ test('Edit preserves the full multi-file target list and redacts sensitive diagn
   const input = `*** Begin Patch\n${paths.map(path => `[${path}#A1B2]\nPUT 1.=1:\n+const api_key = "literal-source-value";`).join('\n')}\n*** End Patch\n`;
   messages.consume({ type: 'tool_execution_start', toolCallId: 'edit', toolName: 'edit', args: { input, i: 'Updating files token=metadata-secret', api_key: 'private-metadata' } });
   assert.equal(messages.tools.get('edit')?.target, paths.join(', '));
+  assert.deepEqual(messages.tools.get('edit')?.paths, paths);
   assert.doesNotMatch(messages.tools.get('edit')?.detail ?? '', /metadata-secret|private-metadata/);
 });
 
@@ -82,6 +125,7 @@ test('Read, Write and legacy Edit preserve ordinary path arguments without alter
   for (const [name, args, target] of cases) {
     messages.consume({ type: 'tool_execution_start', toolCallId: target, toolName: name, args });
     assert.equal(messages.tools.get(target)?.target, target);
+    assert.equal(messages.tools.get(target)?.paths, undefined);
   }
   assert.equal(messages.tools.get('src/write.ts')?.input, 'const token = "literal-value";');
 });

@@ -165,12 +165,48 @@ export async function checkMainFrameStates(): Promise<string[]> {
       verify(disclosure?.open && caret && getComputedStyle(caret).opacity === '1' && new DOMMatrix(getComputedStyle(caret).transform).b > .99,
         'Tool or Advisor updates reset a persistent expanded caret.');
     }
+    const editPaths = ['/site/index.html', '/site/projects/index.html', '/site/blog/index.html', '/site/blog/first/index.html', '/site/blog/second/index.html'];
+    const editTool = { ...disclosureTool, name: 'edit', paths: editPaths, target: editPaths.join(', '), detail: 'Raw patch diagnostic sentinel.', input: 'Original patch input.', output: 'Original edit output.' };
+    for (const state of ['pending', 'running', 'succeeded', 'failed', 'interrupted'] satisfies RuntimeSnapshot['tools'][number]['state'][]) {
+      runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...editTool, state }] };
+      view.update(runtime, runtime.id);
+      const row = view.content.querySelector<HTMLDetailsElement>('.tool'), summary = row?.querySelector('summary');
+      if (!row || !summary) throw new Error('Missing compact Edit row.');
+      const expected = state === 'pending' || state === 'running' ? 'Editing 5 files' : state === 'succeeded' ? 'Edited 5 files' : state === 'failed' ? 'Edit failed 5 files' : 'Edit interrupted 5 files';
+      verify(summary.querySelector('.tool-name')?.textContent === expected && !summary.querySelector('.tool-target')?.textContent,
+        'A multi-file Edit exposed full paths in its compact row or claimed the wrong outcome.');
+      row.open = true;
+      const paths = Array.from(row.querySelectorAll<HTMLElement>('.tool-path'));
+      verify(paths.map(path => path.textContent).join('|') === 'index.html|projects/index.html|blog/index.html|blog/first/index.html|blog/second/index.html'
+        && paths.every((path, index) => path.title === editPaths[index]), 'Expanded Edit paths lost directory distinctions or full-path titles.');
+      verify(row.querySelector('.tool-detail')?.textContent === editTool.detail && row.querySelector('.tool-input')?.textContent === editTool.input
+        && row.querySelector('.tool-output')?.textContent === editTool.output, 'Compact Edit rows changed raw tool diagnostics.');
+    }
+    view.findInput.value = editPaths[1] ?? ''; view.findInput.dispatchEvent(new Event('input'));
+    verify(view.content.querySelector('.tool.find-match'), 'Find lost full Edit paths after stripping their common directory.');
+    view.findInput.value = ''; view.findInput.dispatchEvent(new Event('input'));
+    const longPath = `/site/${'long-filename-'.repeat(80)}.html`;
+    runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...editTool, paths: [longPath], state: 'succeeded' }] };
+    view.update(runtime, runtime.id);
+    const pathTarget = view.content.querySelector<HTMLElement>('.tool-target');
+    verify(pathTarget?.textContent === longPath && pathTarget.title === longPath && pathTarget.scrollWidth > pathTarget.clientWidth
+      && getComputedStyle(pathTarget).whiteSpace === 'nowrap' && getComputedStyle(pathTarget).textOverflow === 'ellipsis',
+    'A single long Edit path did not retain its authoritative path and single-line ellipsis.');
+    verify(view.content.querySelector('.tool-name')?.textContent === 'Edited', 'A completed single-file edit retained an active label.');
+    runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...editTool, paths: ['src/renderer/first.ts', 'src/renderer/second.ts'], state: 'running' }] };
+    view.update(runtime, runtime.id);
+    verify(Array.from(view.content.querySelectorAll('.tool-path')).map(path => path.textContent).join('|') === 'src/renderer/first.ts|src/renderer/second.ts',
+      'Relative Edit paths lost their project directory context.');
+    runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...editTool, paths: [longPath], state: 'running' }] };
+    view.update(runtime, runtime.id);
+    verify(view.content.querySelector('.tool-name')?.textContent === 'Editing', 'A running single-file edit lost its active label.');
     return [
       'Find reveals the exact Advisor note, clears on Escape, restores focus, and survives interrupted exits.',
       'Advisor and task updates preserve unchanged selected prose; agent updates preserve focused disclosures.',
       'Compact panels default closed, reverse safely, and return focus when their data disappears.',
       'Tasks and Agents reserve a lane only while docked and expanded; collapsed, empty, and compact states stay centered, and interrupted thread switches restore opaque panels.',
       'Activity, tool, Advisor, and rule-instruction carets follow the full row text, persist downward when expanded, hide on collapse, and survive updates; existing leading icons remain visible.',
+      'Multi-file Edit rows summarize all five lifecycle states, reveal distinct relative paths with full-path titles, preserve diagnostics, and truncate single long filenames.',
     ];
   } finally {
     getSelection()?.removeAllRanges(); panels.dispose(); view.dispose(); host.remove();

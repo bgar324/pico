@@ -15,9 +15,8 @@ import { SurfacePresence } from './surface-presence';
 import ompLogo from './omp-logo.svg';
 
 interface MessageView { node: HTMLElement; body: HTMLElement; images: MessageImages; reasoning: HTMLElement; error: HTMLElement; value: ChatMessage; advisors: readonly ChatMessage[] | undefined }
-interface ToolView { node: HTMLDetailsElement; summary: HTMLElement; detail: HTMLElement; input: HTMLElement; output: HTMLElement; value: ToolActivity }
+interface ToolView { node: HTMLDetailsElement; summary: HTMLElement; paths: HTMLElement; detail: HTMLElement; input: HTMLElement; output: HTMLElement; value: ToolActivity }
 interface ActivityView { node: HTMLDetailsElement; label: HTMLElement; current: HTMLElement; state: HTMLElement | null; list: HTMLElement }
-const FILE_TOOLS: Record<string, true | undefined> = { read: true, write: true, edit: true, glob: true, grep: true };
 
 function createActivityView(): ActivityView {
   const node = element('details', 'activity-group'), summary = element('summary', 'activity-summary');
@@ -34,7 +33,20 @@ function toolLabel(name: string): string {
   return text.charAt(0).toLocaleUpperCase() + text.slice(1);
 }
 
+function editLabel(state: ToolActivity['state']): string {
+  switch (state) {
+    case 'pending': case 'running': return 'Editing';
+    case 'succeeded': return 'Edited';
+    case 'failed': return 'Edit failed';
+    case 'interrupted': return 'Edit interrupted';
+  }
+}
+
 function toolAction(tool: ToolActivity): string {
+  if (tool.name === 'edit') {
+    const target = tool.paths && tool.paths.length > 1 ? `${tool.paths.length} files` : tool.paths?.[0] ?? tool.target;
+    return `${editLabel(tool.state)}${target ? ` ${target}` : ''}`;
+  }
   if (tool.name === 'eval') return tool.target.trim() || toolLabel(tool.name);
   return `${toolLabel(tool.name)}${tool.target ? ` ${tool.target}` : ''}`;
 }
@@ -504,11 +516,11 @@ export class Conversation {
     let view = this.tools.get(tool.id);
     if (!view) {
       const node = element('details', 'tool'); node.dataset.toolId = tool.id;
-      const summary = element('summary'); const detail = element('pre', 'tool-detail'); const input = element('pre', 'tool-input'); const output = element('pre', 'tool-output');
+      const summary = element('summary'), paths = element('div', 'tool-paths'); const detail = element('pre', 'tool-detail'); const input = element('pre', 'tool-input'); const output = element('pre', 'tool-output');
       const detailBlock = element('div', 'tool-block'), outputBlock = element('div', 'tool-block');
       detailBlock.append(detail, input); outputBlock.append(output);
-      node.append(summary, detailBlock, outputBlock); host.append(node);
-      view = { node, summary, detail, input, output, value: tool }; this.tools.set(tool.id, view);
+      node.append(summary, paths, detailBlock, outputBlock); host.append(node);
+      view = { node, summary, paths, detail, input, output, value: tool }; this.tools.set(tool.id, view);
     } else if (view.node.parentElement !== host) {
       if (view.node.closest<HTMLDetailsElement>('.activity-group')?.open) {
         const nextGroup = host.closest<HTMLDetailsElement>('.activity-group'); if (nextGroup) nextGroup.open = true;
@@ -516,11 +528,29 @@ export class Conversation {
       host.append(view.node);
     }
     if (view.value !== tool || !view.summary.textContent) {
-      view.node.classList.toggle('tool-files', FILE_TOOLS[tool.name] === true);
+      const paths = tool.name === 'edit' ? tool.paths ?? [] : [];
+      const multipleFiles = paths.length > 1;
       const duration = tool.endedAt === null ? null : Math.max(0, (tool.endedAt - tool.startedAt) / 1000);
       view.summary.title = duration !== null && duration >= 1 ? `Duration: ${duration.toFixed(1)}s` : '';
       view.summary.setAttribute('aria-description', tool.state);
-      view.summary.replaceChildren(toolIcon(tool.name), element('span', tool.name === 'eval' ? 'tool-name tool-purpose' : 'tool-name', tool.name === 'eval' ? toolAction(tool) : toolLabel(tool.name)), element('span', 'tool-target', tool.name === 'eval' ? '' : tool.target), disclosureCaret());
+      const actionOnly = tool.name === 'eval' || multipleFiles;
+      const target = actionOnly ? '' : paths[0] ?? tool.target;
+      const targetNode = element('span', 'tool-target', target); targetNode.title = target;
+      view.summary.replaceChildren(toolIcon(tool.name), element('span', tool.name === 'eval' ? 'tool-name tool-purpose' : 'tool-name', actionOnly ? toolAction(tool) : tool.name === 'edit' ? editLabel(tool.state) : toolLabel(tool.name)), targetNode, disclosureCaret());
+      if (view.value.paths !== tool.paths || !view.paths.childElementCount) {
+        const components = paths.map(path => path.split('/'));
+        let common = 0;
+        const first = components[0] ?? [];
+        if (paths.every(path => path.startsWith('/'))) {
+          while (common < first.length - 1 && components.every(parts => common < parts.length - 1 && parts[common] === first[common])) common++;
+        }
+        view.paths.replaceChildren(...paths.map((path, index) => {
+          const row = element('div', 'tool-path', components[index]?.slice(common).join('/') ?? path);
+          row.title = path;
+          return row;
+        }));
+      }
+      view.paths.hidden = !multipleFiles;
       if (view.detail.textContent !== tool.detail) {
         const existing = view.detail.firstChild;
         if (existing instanceof Text && tool.detail.startsWith(existing.data)) existing.appendData(tool.detail.slice(existing.length));
@@ -556,7 +586,8 @@ export class Conversation {
     for (const node of this.content.querySelectorAll<HTMLElement>('.message:not([hidden]), .tool')) {
       const notes = node.querySelectorAll<HTMLElement>('.advisor-notice');
       for (const candidate of notes.length ? notes : [node]) {
-        if (!needle || !(candidate.textContent ?? '').toLocaleLowerCase().includes(needle)) continue;
+        if (!needle || (!(candidate.textContent ?? '').toLocaleLowerCase().includes(needle)
+          && !Array.from(candidate.querySelectorAll<HTMLElement>('.tool-path')).some(path => path.title.toLocaleLowerCase().includes(needle)))) continue;
         candidate.classList.add('find-match'); this.hits.push(candidate);
       }
     }
@@ -570,10 +601,10 @@ export class Conversation {
     if (!hit) return;
     if (hit instanceof HTMLDetailsElement) hit.open = true;
     const needle = this.query.toLocaleLowerCase();
-    const candidates = Array.from(hit.querySelectorAll<HTMLElement>('.tool-detail,.tool-input,.tool-output,.result-raw,.result-metadata,.markdown :is(p,li,pre,h1,h2,h3,h4,h5,h6,dt,dd,td,th),.result-fields dt,.result-fields dd,.result-title'));
+    const candidates = Array.from(hit.querySelectorAll<HTMLElement>('.tool-path,.tool-detail,.tool-input,.tool-output,.result-raw,.result-metadata,.markdown :is(p,li,pre,h1,h2,h3,h4,h5,h6,dt,dd,td,th),.result-fields dt,.result-fields dd,.result-title'));
     const visibleMatch = hit.checkVisibility() && hit.innerText.toLocaleLowerCase().includes(needle);
-    const target = candidates.find(node => node.checkVisibility() && node.innerText.toLocaleLowerCase().includes(needle))
-      ?? (visibleMatch ? hit : candidates.find(node => (node.textContent ?? '').toLocaleLowerCase().includes(needle)) ?? hit);
+    const target = candidates.find(node => node.checkVisibility() && (node.innerText.toLocaleLowerCase().includes(needle) || node.classList.contains('tool-path') && node.title.toLocaleLowerCase().includes(needle)))
+      ?? (visibleMatch ? hit : candidates.find(node => (node.textContent ?? '').toLocaleLowerCase().includes(needle) || node.classList.contains('tool-path') && node.title.toLocaleLowerCase().includes(needle)) ?? hit);
     for (let ancestor: HTMLElement | null = target; ancestor; ancestor = ancestor.parentElement) {
       if (ancestor instanceof HTMLDetailsElement) ancestor.open = true;
     }

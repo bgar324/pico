@@ -313,8 +313,13 @@ async function checkToolLabels(view: Conversation): Promise<string> {
   group.open = true; edit.open = true; evaluation.open = true;
   const assertFiles = (): void => {
     for (const tool of runtime.tools.filter(tool => ['read', 'write', 'edit', 'glob', 'grep'].includes(tool.name))) {
-      const target = view.content.querySelector<HTMLElement>(`[data-tool-id="${tool.id}"] > summary > .tool-target`);
-      verify(target?.checkVisibility() && target.innerText === tool.target && getComputedStyle(target).whiteSpace === 'normal', `${tool.name} hid its file context.`);
+      const row = view.content.querySelector<HTMLElement>(`[data-tool-id="${tool.id}"]`);
+      if (tool.name === 'edit') {
+        verify(Array.from(row?.querySelectorAll<HTMLElement>('.tool-path') ?? []).map(path => path.title).join('|') === tool.paths?.join('|'), 'Edit hid its expanded file context.');
+      } else {
+        const target = row?.querySelector<HTMLElement>('summary > .tool-target');
+        verify(target?.checkVisibility() && target.innerText === tool.target && getComputedStyle(target).whiteSpace === 'nowrap', `${tool.name} hid its file context.`);
+      }
     }
   };
   assertFiles();
@@ -322,17 +327,10 @@ async function checkToolLabels(view: Conversation): Promise<string> {
   try {
     await frame();
     const target = edit.querySelector<HTMLElement>('summary > .tool-target'), shell = view.content.querySelector<HTMLElement>('[data-tool-id="label-bash"] .tool-target');
-    const text = target?.firstChild;
-    if (!target || !(text instanceof Text) || !shell) throw new Error('Missing narrow filename target.');
-    verify(target.scrollWidth <= target.clientWidth + 1 && target.getBoundingClientRect().height > 20, 'Multi-file Edit target clipped later filenames rather than wrapping.');
-    const bounds = target.getBoundingClientRect(), range = document.createRange();
-    for (const path of paths) {
-      const filename = path.slice(path.lastIndexOf('/') + 1), start = text.data.indexOf(filename);
-      verify(start >= 0, `Edit omitted ${filename}.`);
-      range.setStart(text, start); range.setEnd(text, start + filename.length);
-      verify([...range.getClientRects()].every(rect => rect.width > 0 && rect.left >= bounds.left - 1 && rect.right <= bounds.right + 1), `Edit clipped ${filename}.`);
-    }
-    verify(getComputedStyle(shell).whiteSpace === 'nowrap', 'Filename wrapping expanded shell commands into giant rows.');
+    verify(target?.textContent === '' && edit.querySelector('.tool-name')?.textContent === 'Editing 2 files', 'Multi-file Edit did not stay compact at narrow width.');
+    const visiblePaths = Array.from(edit.querySelectorAll<HTMLElement>('.tool-path'));
+    verify(visiblePaths.length === paths.length && visiblePaths.every((path, index) => path.textContent === paths[index] && path.checkVisibility()), 'Expanded narrow Edit omitted paths.');
+    verify(shell && getComputedStyle(shell).whiteSpace === 'nowrap', 'Filename summaries expanded shell commands into giant rows.');
   } finally { view.node.style.removeProperty('width'); }
   group.open = false; edit.open = false;
   view.findInput.value = paths[1] ?? ''; view.findInput.dispatchEvent(new Event('input'));
@@ -351,11 +349,12 @@ async function checkToolLabels(view: Conversation): Promise<string> {
   verify(restored && restoredGroup && !restored.open && !restoredGroup.open && view.content.querySelector('[data-tool-id="label-eval"] .tool-name')?.textContent === evalArgs.title, 'Restored tool history lost purpose labels or started expanded.');
   if (!restored || !restoredGroup) throw new Error('Missing restored tool labels.');
   restoredGroup.open = true; restored.open = true; assertFiles();
-  runtime = { ...runtime, revision: 2, tools: runtime.tools.map(tool => tool.id === 'label-edit' ? { ...tool, target: `${tool.target}, src/renderer/icons.ts`, state: 'succeeded' } : tool.id === 'label-eval' ? { ...tool, target: 'Comparing restored labels' } : tool) };
+  runtime = { ...runtime, revision: 2, tools: runtime.tools.map(tool => tool.id === 'label-edit' ? { ...tool, paths: [...tool.paths ?? [], 'src/renderer/icons.ts'], state: 'succeeded' } : tool.id === 'label-eval' ? { ...tool, target: 'Comparing restored labels' } : tool) };
   view.update(runtime, runtime.id);
-  verify(view.content.querySelector('[data-tool-id="label-edit"]') === restored && restored.open && restoredGroup.open && restored.querySelector('summary')?.textContent?.includes('src/renderer/icons.ts') && restored.querySelector('summary')?.getAttribute('aria-description') === 'succeeded', 'Restored Edit updates lost filenames, state, or disclosure identity.');
+  verify(view.content.querySelector('[data-tool-id="label-edit"]') === restored && restored.open && restoredGroup.open && restored.querySelector('.tool-name')?.textContent === 'Edited 3 files' && restored.querySelector('summary')?.getAttribute('aria-description') === 'succeeded'
+    && Array.from(restored.querySelectorAll<HTMLElement>('.tool-path')).some(path => path.title === 'src/renderer/icons.ts'), 'Restored Edit updates lost filenames, state, or disclosure identity.');
   verify(view.content.querySelector('[data-tool-id="label-eval"] .tool-name')?.textContent === 'Comparing restored labels', 'Restored Eval updates kept a stale purpose.');
-  return 'Native Eval titles replace bare tool names; all file rows retain targets, multi-file Edit filenames wrap at narrow widths, Find reveals purpose/files, and live/restored updates preserve disclosures, focus, and accessible state.';
+  return 'Native Eval titles replace bare tool names; file rows retain ellipsized targets, multi-file Edit rows reveal distinct paths on expansion, Find reveals purpose/files, and live/restored updates preserve disclosures, focus, and accessible state.';
 }
 async function checkShimmerSpeed(view: Conversation, host: HTMLElement): Promise<string> {
   const composer = document.createElement('div');
