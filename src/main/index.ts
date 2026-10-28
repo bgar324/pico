@@ -37,6 +37,7 @@ let contextMenu: NativeContextMenu | null = null;
 let providerConnections: ProviderConnections | null = null;
 let pendingConnectionId: string | null = null;
 let quitting = false;
+let quitConfirmationPending = false;
 
 async function decodeRasterImage(image: ImageContent): Promise<Electron.NativeImage> {
   const bytes = Buffer.from(image.data, 'base64');
@@ -197,9 +198,26 @@ const host: DesktopHost = {
 function menuCommand(command: UiCommand): void {
   createWindow(); emit({ kind: 'command', command });
 }
+async function confirmQuit(): Promise<void> {
+  if (quitting || quitConfirmationPending) return;
+  quitConfirmationPending = true;
+  try {
+    const current = createWindow(); current.show();
+    const result = await dialog.showMessageBox(current, {
+      type: 'question', message: 'Quit Pico?',
+      detail: 'Running work will stop. Your saved conversations will be kept.',
+      buttons: ['Cancel', 'Quit'], defaultId: 0, cancelId: 0, noLink: true,
+    });
+    if (result.response === 1 && !quitting) app.quit();
+  } catch (error) {
+    process.stderr.write(`Quit confirmation failed: ${sanitizeDiagnostic(String(error))}\n`);
+  } finally {
+    quitConfirmationPending = false;
+  }
+}
 function installMenus(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate([
-    { label: 'Pico', submenu: [{ role: 'about' }, { type: 'separator' }, { label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: () => menuCommand('settings') }, { type: 'separator' }, { role: 'services' }, { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' }, { type: 'separator' }, { role: 'quit' }] },
+    { label: 'Pico', submenu: [{ role: 'about' }, { type: 'separator' }, { label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: () => menuCommand('settings') }, { type: 'separator' }, { role: 'services' }, { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' }, { type: 'separator' }, { label: 'Quit Pico', accelerator: 'CmdOrCtrl+Q', click: () => { void confirmQuit(); } }] },
     { label: 'File', submenu: [{ label: 'New thread', accelerator: 'CmdOrCtrl+N', click: () => menuCommand('new-thread') }, { label: 'Open project…', accelerator: 'CmdOrCtrl+O', click: () => menuCommand('open-project') }, { type: 'separator' }, { role: 'close' }] },
     { label: 'Edit', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] },
     { label: 'View', submenu: [{ label: 'Toggle sidebar', accelerator: 'CmdOrCtrl+Alt+S', click: () => menuCommand('toggle-sidebar') }, { label: 'Toggle changes', accelerator: 'CmdOrCtrl+Alt+D', click: () => menuCommand('toggle-changes') }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'togglefullscreen' }] },

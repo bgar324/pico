@@ -95,7 +95,7 @@ Chat and settings layouts follow the installed Codex desktop reference where OMP
 
 Scrollbars use slim, muted thumbs on transparent tracks in both appearances. Native wheel, keyboard, and thumb-drag scrolling remain available; the transcript keeps stable gutters to avoid layout shifts.
 
-Pico keeps up to three OMP processes, recycling only idle ones. Closing the window does not stop active conversations. Quitting closes every app-owned process with bounded termination escalation.
+Pico keeps up to three OMP processes, recycling only idle ones. Closing the window does not stop active conversations. Command-Q and Pico > Quit Pico show a native confirmation with Cancel selected by default. Cancel or Escape keeps the app and running work open; confirming Quit closes every app-owned process with bounded termination escalation.
 
 Queued previews use attachments submitted through Pico in the current runtime. Image bytes load separately from status updates and each preview is reused while its entry stays mounted or cached. Removing the entry or resetting the runtime releases its queued preview data, including in inactive conversations. OMP's current RPC exposes only queue text, so previews lost across a runtime restart or an arbitrary input-hook rewrite cannot be reconstructed from matching text or history.
 
@@ -114,6 +114,7 @@ Retracted images come from the engine's actual queued payload, which OMP may res
 | Open project | Command-O |
 | New thread | Command-N |
 | Close window | Command-W |
+| Quit with confirmation | Command-Q |
 | Quick switcher | Command-K |
 | Find in conversation | Command-F |
 | Settings | Command-, |
