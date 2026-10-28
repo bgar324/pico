@@ -1,4 +1,4 @@
-import type { ImageContent, QueuedMessage, RuntimeSnapshot } from '../shared/types';
+import type { ChatMessage, ImageContent, QueuedMessage, RuntimeSnapshot } from '../shared/types';
 import { isImageContent } from '../shared/validation';
 import { element, errorText, iconButton, request } from './dom';
 import { icon } from './icons';
@@ -19,6 +19,7 @@ interface PreviewResource { state: PreviewState }
 interface QueuedRow {
   key: string;
   entry: QueueEntry;
+  projection: ChatMessage | undefined;
   node: HTMLElement;
   body: HTMLElement;
   images: MessageImages;
@@ -47,7 +48,11 @@ export class QueuedMessages {
   private disposed = false;
 
   onEdit: ((value: QueuedEditRequest) => Promise<void>) | null = null;
-  constructor(private readonly onImageLoad: () => void) {}
+  constructor(
+    private readonly onImageLoad: () => void,
+    private readonly onSteer: () => void,
+    private readonly projectionTarget: (id: string) => { node: HTMLElement; delivery: HTMLElement } | undefined,
+  ) {}
 
   update(runtime: RuntimeSnapshot | undefined, threadID: string | null): void {
     if (this.disposed) return;
@@ -56,7 +61,16 @@ export class QueuedMessages {
       ...runtime.queuedSteers.map(entry => ({ ...entry, steering: true })),
       ...runtime.queuedFollowUps.map(entry => ({ ...entry, steering: false })),
     ] : [];
-    const signature = JSON.stringify(entries);
+    const projections = runtime?.messages.filter(message => message.role === 'user' && message.delivery) ?? [];
+    const represented = new Map<string, ChatMessage[]>();
+    for (const message of projections) {
+      const delivery = message.delivery;
+      if (!delivery) continue;
+      const key = JSON.stringify([delivery.queue, message.text, delivery.imageRef]);
+      const matches = represented.get(key);
+      if (matches) matches.push(message); else represented.set(key, [message]);
+    }
+    const signature = JSON.stringify([entries, projections.map(message => [message.id, message.text, message.delivery, message.images?.length, !!this.projectionTarget(message.id)])]);
     if (signature === this.signature) return;
     this.signature = signature;
     const nextRows = new Map<string, QueuedRow>();
@@ -76,14 +90,16 @@ export class QueuedMessages {
       occurrences.set(identity, occurrence + 1);
       const key = JSON.stringify([identity, occurrence]);
       const row = this.rows.get(key) ?? this.createRow(key, entry);
+      if (!row.entry.steering && entry.steering) row.error.hidden = true;
       row.entry = entry;
+      row.projection = represented.get(JSON.stringify([entry.steering ? 'steering' : 'followUp', entry.text, entry.imageRef]))?.shift();
       const earlierHasImages = earlierFollowUps.get(entry.text);
       row.ambiguous = !entry.steering && earlierHasImages !== undefined && (earlierHasImages || entry.imageCount > 0);
       if (!entry.steering) earlierFollowUps.set(entry.text, (earlierHasImages ?? false) || entry.imageCount > 0);
       const duplicates = queueCounts.get(JSON.stringify([entry.steering, entry.text]));
       row.ambiguousEdit = !!duplicates && duplicates.count > 1 && duplicates.hasImages;
       nextRows.set(key, row);
-      if (entry.imageRef !== null) liveRefs.set(entry.imageRef, entry.imageCount);
+      if (entry.imageRef !== null && !row.projection?.images?.length) liveRefs.set(entry.imageRef, entry.imageCount);
     }
     for (const [key, row] of this.rows) if (!nextRows.has(key)) this.release(row);
     this.rows = nextRows;
@@ -93,11 +109,26 @@ export class QueuedMessages {
       this.resources.set(ref, resource);
       void this.loadImages(threadID, ref, count, resource);
     }
-    for (const [index, row] of [...this.rows.values()].entries()) {
-      const current = this.node.children[index] ?? null;
-      if (current !== row.node) {
-        if (row.node.parentElement === this.node) this.node.moveBefore(row.node, current);
-        else this.node.insertBefore(row.node, current);
+    let index = 0;
+    for (const row of this.rows.values()) {
+      const target = row.projection ? this.projectionTarget(row.projection.id) : undefined;
+      row.edit.classList.toggle('user-message-action', !!row.projection);
+      row.edit.classList.toggle('user-message-edit', !!row.projection);
+      if (row.projection) {
+        row.node.remove();
+        if (target) {
+          if (row.edit.parentElement !== target.node) target.node.append(row.edit);
+          if (row.error.parentElement !== target.delivery) target.delivery.append(row.error);
+        }
+        else { row.edit.remove(); row.error.remove(); }
+      } else {
+        if (row.edit.parentElement !== row.actions) row.actions.append(row.edit);
+        if (row.error.parentElement !== row.body.parentElement) row.body.parentElement?.append(row.error);
+        const current = this.node.children[index++] ?? null;
+        if (current !== row.node) {
+          if (row.node.parentElement === this.node) this.node.moveBefore(row.node, current);
+          else this.node.insertBefore(row.node, current);
+        }
       }
       this.renderRow(row);
     }
@@ -122,7 +153,7 @@ export class QueuedMessages {
     const send = iconButton('steer', 'Steer', () => this.sendNow(row), 'queued-send');
     send.append(element('span', '', 'Steer'));
     const edit = iconButton('edit', 'Edit queued message', () => this.edit(row), 'queued-edit');
-    const row: QueuedRow = { key, entry, node, body, images, previewStatus, actions, send, edit, error, ambiguous: false, ambiguousEdit: false, pendingAction: null, alreadySent: false, decodeFailed: false };
+    const row: QueuedRow = { key, entry, projection: undefined, node, body, images, previewStatus, actions, send, edit, error, ambiguous: false, ambiguousEdit: false, pendingAction: null, alreadySent: false, decodeFailed: false };
     content.append(body, images.node, previewStatus, error);
     actions.append(send, edit); node.append(marker, content, actions);
     return row;
@@ -146,6 +177,7 @@ export class QueuedMessages {
     row.send.hidden = entry.steering;
     row.send.disabled = row.pendingAction !== null || row.ambiguous;
     row.send.title = row.ambiguous ? AMBIGUOUS_SEND : SEND_TITLE;
+    row.edit.hidden = row.alreadySent || row.projection?.delivery?.status === 'sending';
     row.edit.disabled = row.pendingAction !== null || row.ambiguousEdit;
     row.edit.title = row.ambiguousEdit ? AMBIGUOUS_EDIT : 'Withdraw this message to edit in the composer';
     row.edit.setAttribute('aria-busy', String(row.pendingAction === 'edit'));
@@ -183,6 +215,7 @@ export class QueuedMessages {
   private async sendNow(row: QueuedRow): Promise<void> {
     const threadID = this.threadID;
     if (!threadID || !this.isLive(row) || row.entry.steering || row.pendingAction !== null || row.ambiguous || row.alreadySent) return;
+    this.onSteer();
     row.pendingAction = 'steer'; row.error.hidden = true; this.renderRow(row);
     try {
       const promoted = await request({ kind: 'promote-queued', id: threadID, message: row.entry.text });
@@ -199,13 +232,13 @@ export class QueuedMessages {
   private async edit(row: QueuedRow): Promise<void> {
     const threadID = this.threadID;
     const onEdit = this.onEdit;
-    if (!threadID || !onEdit || !this.isLive(row) || row.pendingAction !== null || row.ambiguousEdit || row.alreadySent) return;
+    if (!threadID || !onEdit || !this.isLive(row) || row.pendingAction !== null || row.ambiguousEdit || row.alreadySent || row.projection?.delivery?.status === 'sending') return;
     const preview = row.entry.imageRef === null ? undefined : this.resources.get(row.entry.imageRef)?.state;
     row.pendingAction = 'edit'; row.error.hidden = true; this.renderRow(row);
     try {
       // The canonical queue can remove this row before the mutation response arrives.
       // Restoration belongs to the composer, not to this row's lifetime.
-      await onEdit({ threadID, queue: row.entry.steering ? 'steering' : 'followUp', entry: row.entry, images: preview?.kind === 'ready' ? preview.images : undefined });
+      await onEdit({ threadID, queue: row.entry.steering ? 'steering' : 'followUp', entry: row.entry, images: row.projection?.images ?? (preview?.kind === 'ready' ? preview.images : undefined) });
     } catch (failure) {
       if (this.threadID === threadID && this.isLive(row)) { row.error.textContent = errorText(failure); row.error.hidden = false; }
     } finally {
@@ -217,7 +250,7 @@ export class QueuedMessages {
   private isCurrentResource(threadID: string, ref: string, resource: PreviewResource): boolean {
     return !this.disposed && this.threadID === threadID && this.resources.get(ref) === resource;
   }
-  private release(row: QueuedRow): void { row.images.dispose(); row.node.remove(); }
+  private release(row: QueuedRow): void { row.images.dispose(); row.edit.remove(); row.error.remove(); row.node.remove(); }
   private clear(): void {
     for (const row of this.rows.values()) this.release(row);
     this.rows.clear(); this.resources.clear(); this.signature = '';

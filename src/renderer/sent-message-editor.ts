@@ -40,7 +40,7 @@ export class SentMessageEditor {
   }
 
   open(target: EditTarget): void {
-    if (this.disposed || target.threadID !== this.threadID) return;
+    if (this.disposed || target.threadID !== this.threadID || target.message.delivery || target.message.id.startsWith('pending-steer-')) return;
     if (this.session) {
       if (this.session.target.message.id !== target.message.id) {
         this.session.error.textContent = this.session.pending ? 'Wait for this message to send.' : 'Send or cancel this edit before editing another message.';

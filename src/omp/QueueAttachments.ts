@@ -1,23 +1,25 @@
 import type { ImageContent, QueuedMessage } from '../shared/types';
 
 type Queue = 'steering' | 'followUp';
-interface Entry extends QueuedMessage { chip: string; submission: string | null }
+export interface QueueEntry extends QueuedMessage { chip: string; submission: string | null }
 interface Submission { id: string; queue: Queue; text: string; chip: string; images: readonly ImageContent[]; bound: boolean; admittedAt: number | null }
 interface Bucket<T> { values: T[]; next: number }
 export interface QueueSnapshot { steering: QueuedMessage[]; followUp: QueuedMessage[] }
-interface Promotion { text: string; entry: Entry | null }
-interface Retraction { queue: Queue; entry: Entry; images: readonly ImageContent[] }
+interface Promotion { text: string; entry: QueueEntry | null }
+interface Retraction { queue: Queue; entry: QueueEntry; images: readonly ImageContent[] }
 
 /** Native queues expose chip text only. Annotate attributable Pico submissions,
  * never infer attachments from a literal "[Image]" or from transcript history. */
 export class QueueAttachments {
-  private queues: Record<Queue, Entry[]> = { steering: [], followUp: [] };
+  private queues: Record<Queue, QueueEntry[]> = { steering: [], followUp: [] };
+  private additions: Record<Queue, QueueEntry[]> = { steering: [], followUp: [] };
   private readonly submissions = new Map<string, Submission>();
   private promotion: Promotion | null = null;
   private retraction: Retraction | null = null;
 
   submitted(id: string, queue: Queue, text: string, images: readonly ImageContent[]): void {
     this.submissions.set(id, { id, queue, text, chip: text || (images.length ? '[Image]' : ''), images, bound: false, admittedAt: null });
+    this.additions[queue] = [];
   }
 
   getImages(imageRef: string): readonly ImageContent[] {
@@ -27,6 +29,12 @@ export class QueueAttachments {
       throw new Error('Queued image preview has expired.');
     }
     return submission.images;
+  }
+
+  entries(queue: Queue): readonly QueueEntry[] { return this.queues[queue]; }
+  hasUnbound(queue: Queue): boolean {
+    for (const submission of this.submissions.values()) if (submission.queue === queue && !submission.bound) return true;
+    return false;
   }
 
   prepareRetraction(queue: Queue, text: string, imageRef: string | null): Retraction | null {
@@ -58,7 +66,18 @@ export class QueueAttachments {
 
   admitted(id: string, lifecycle: number): void {
     const submission = this.submissions.get(id);
-    if (submission) submission.admittedAt = lifecycle;
+    if (!submission) return;
+    submission.admittedAt = lifecycle;
+    if (submission.bound) return;
+    const candidates = this.additions[submission.queue].filter(entry => entry.submission === null && this.queues[submission.queue].includes(entry));
+    const entry = candidates.length === 1 ? candidates[0] : undefined;
+    if (!entry) return;
+    // A rewritten chip is attributable only at its correlated admission reply.
+    submission.bound = true;
+    entry.submission = id;
+    entry.text = submission.text;
+    entry.imageCount = submission.images.length;
+    entry.imageRef = submission.images.length ? id : null;
   }
 
   rejected(id: string): void {
@@ -113,7 +132,7 @@ export class QueueAttachments {
       }
     }
     for (const kind of ['steering', 'followUp'] satisfies Queue[]) {
-      const previous = new Map<string, Bucket<Entry>>();
+      const previous = new Map<string, Bucket<QueueEntry>>();
       for (const entry of this.queues[kind]) {
         const bucket = previous.get(entry.chip);
         if (bucket) bucket.values.push(entry); else previous.set(entry.chip, { values: [entry], next: 0 });
@@ -138,6 +157,7 @@ export class QueueAttachments {
           bucket.values = bucket.values.map(entry => ({ chip: entry.chip, text: entry.chip, imageCount: 0, imageRef: null, submission: null }));
         }
       }
+      const unmatched: QueueEntry[] = [];
       this.queues[kind] = incoming[kind].map(chip => {
         const old = previous.get(chip);
         const retained = old ? old.values[old.next++] : undefined;
@@ -148,8 +168,11 @@ export class QueueAttachments {
           submitted.bound = true;
           return { chip, text: submitted.text, imageCount: submitted.images.length, imageRef: submitted.images.length ? submitted.id : null, submission: submitted.id };
         }
-        return { chip, text: chip, imageCount: 0, imageRef: null, submission: null };
+        const entry: QueueEntry = { chip, text: chip, imageCount: 0, imageRef: null, submission: null };
+        unmatched.push(entry);
+        return entry;
       });
+      if (unmatched.length) this.additions[kind] = unmatched;
     }
     const bound = new Set([...this.queues.steering, ...this.queues.followUp].flatMap(entry => entry.submission ? [entry.submission] : []));
     for (const [id, submission] of this.submissions) {
@@ -167,6 +190,7 @@ export class QueueAttachments {
 
   reset(): void {
     this.queues = { steering: [], followUp: [] };
+    this.additions = { steering: [], followUp: [] };
     this.submissions.clear();
     this.promotion = null;
     this.retraction = null;

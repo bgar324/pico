@@ -183,11 +183,11 @@ export class RpcClient extends EventEmitter<{ event: [JsonRecord]; idle: [] }> {
       const pending = id === null ? undefined : this.pending.get(id);
       if (pending && id !== null) {
         this.pending.delete(id); clearTimeout(pending.timer); pending.dispose();
-        if (command === 'get_messages' || command === 'get_messages_page' || (command === 'set_todos' && frame.success === true) || (command === 'compact' && frame.success === true)) this.emit('event', frame);
+        if (command === 'prompt' || command === 'abort_and_prompt' || command === 'get_messages' || command === 'get_messages_page' || (command === 'set_todos' && frame.success === true) || (command === 'compact' && frame.success === true)) this.emit('event', frame);
         if (frame.success === true) pending.resolve(frame.data ?? null);
         else pending.reject(new RpcError('command', typeof frame.error === 'string' ? frame.error : 'OMP rejected the command.', pending.command, typeof frame.code === 'string' ? frame.code : null));
         if (!this.pending.size) queueMicrotask(() => { if (this.phase === 'ready' && !this.pending.size) this.emit('idle'); });
-      } else if (frame.success === false || command === 'prompt' || command === 'abort_and_prompt' || command === 'compact') this.emit('event', frame);
+      } else if (frame.success === false || command === 'prompt' || command === 'abort_and_prompt' || command === 'promote_queued_message' || command === 'compact') this.emit('event', frame);
     } else if (frame.type === 'rpc_frame_error') throw new RpcError('protocol', typeof frame.error === 'string' ? frame.error : 'OMP could not deliver a complete event.');
     else this.emit('event', frame);
   }

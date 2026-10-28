@@ -8,11 +8,22 @@ import { dialogResponse, parseDialog } from './dialogs';
 import { sanitizeDiagnostic } from './diagnostics';
 import { committedTodoPhases, parseTodoPhases } from '../shared/todos';
 import { IMAGE_TOTAL_BYTE_LIMIT, imageByteCount, isImageContent } from '../shared/validation';
-import { QueueAttachments, type QueueSnapshot } from './QueueAttachments';
+import { QueueAttachments, type QueueEntry, type QueueSnapshot } from './QueueAttachments';
 import { editableEntry } from './MessageEdit';
 
 interface LiveDialog { request: DialogRequest; token: string; timer: NodeJS.Timeout | undefined; submission: AbortController | null }
 interface StateRead { state: JsonRecord; generation: number; lifecycle: number; config: number; thinking: number; usage: number; title: number }
+interface QueuedDelivery {
+  submissionID: string | null;
+  entry: QueueEntry | null;
+  queue: 'steering' | 'followUp';
+  text: string;
+  images: readonly ImageContent[];
+  state: 'pending' | 'queued' | 'removed' | 'dropped' | 'delivered';
+  projection: (ChatMessage & { delivery: NonNullable<ChatMessage['delivery']> }) | null;
+  promotionID: string | null;
+  withdrawn: boolean;
+}
 
 export class ThreadRuntime {
   readonly recordID: string;
@@ -29,7 +40,9 @@ export class ThreadRuntime {
   private readonly pendingPrompts = new Set<string>();
   private readonly streamingToolBlocks = new Map<string, Set<number>>();
   private readonly queueAttachments = new QueueAttachments();
+  private readonly queuedDeliveries: QueuedDelivery[] = [];
   private queuePromotion: Promise<void> = Promise.resolve();
+  private readonly promotionResolutions = new Map<string, { promise: Promise<void>; resolve: () => void }>();
   private optimisticPrompt: { id: string; message: ChatMessage } | null = null;
   private readonly workPeriods: WorkPeriod[] = [];
   private unanchoredUserMessageID: string | null = null;
@@ -72,7 +85,15 @@ export class ThreadRuntime {
     });
   }
   snapshot(): RuntimeSnapshot {
-    return { ...this.summary(), messages: [...this.store.messages.values(), ...(this.optimisticPrompt ? [this.optimisticPrompt.message] : [])].map(message => ({ ...message, toolIDs: [...message.toolIDs], ...(message.images ? { images: message.images.map(image => ({ ...image })) } : {}), ...(message.details ? { details: structuredClone(message.details) } : {}) })), tools: [...this.store.tools.values()].map(tool => ({ ...tool })) };
+    const projected = this.queuedDeliveries.flatMap<ChatMessage>(delivery => {
+      const message = delivery.projection;
+      if (!message || delivery.state === 'delivered' || delivery.withdrawn) return [];
+      if (delivery.state !== 'removed' && delivery.state !== 'dropped') return [message];
+      if (message.delivery.status !== 'accepted') return [];
+      const { delivery: _, ...retained } = message;
+      return [{ ...retained, error: 'Steer left the native queue before delivery was confirmed. Your original message is kept here and was not resent.' }];
+    });
+    return { ...this.summary(), messages: [...this.store.messages.values(), ...(this.optimisticPrompt ? [this.optimisticPrompt.message] : []), ...projected].map(message => ({ ...message, toolIDs: [...message.toolIDs], ...(message.images ? { images: message.images.map(image => ({ ...image })) } : {}), ...(message.delivery ? { delivery: { ...message.delivery } } : {}), ...(message.details ? { details: structuredClone(message.details) } : {}) })), tools: [...this.store.tools.values()].map(tool => ({ ...tool })) };
   }
   summary(): RuntimeSummary { return structuredClone(this.state); }
   getQueuedImages(imageRef: string): readonly ImageContent[] { return this.queueAttachments.getImages(imageRef); }
@@ -81,7 +102,7 @@ export class ThreadRuntime {
     return this.state.status.kind === 'closed' ||
       (this.state.status.kind === 'ready' && this.state.status.activity === 'idle' && !this.historyEditing && !this.pendingPrompts.size && !this.client.hasPendingRequests &&
         !this.dialogs.size && !this.naming && !this.nativeTitleTask && !this.modelRefresh && !this.configurationChanges &&
-        !this.state.queuedFollowUps.length && !this.state.queuedSteers.length);
+        !this.state.queuedFollowUps.length && !this.state.queuedSteers.length && !this.queuedDeliveries.some(delivery => delivery.state === 'pending'));
   }
 
   async connect(executable: string, reason: 'open' | 'provider-connections' = 'open'): Promise<void> {
@@ -91,6 +112,7 @@ export class ThreadRuntime {
     this.titleRevision++; this.sessionID = null; this.nativeSessionName = null; this.naming = null;
     if (reason === 'open') this.workPeriods.length = 0;
     this.optimisticPrompt = null;
+    this.queuedDeliveries.length = 0;
     this.unanchoredUserMessageID = null;
     this.advisorContinuationID = null;
     this.state.status = { kind: 'connecting' }; this.state.error = null; this.state.contextUsage = null;
@@ -282,8 +304,14 @@ export class ThreadRuntime {
     if (!isReady(this.state.status) || (!message.trim() && !options.images?.length)) return false;
     const generation = this.generation, id = randomUUID(), busy = isBusy(this.state.status);
     const images = options.images?.filter(isImageContent) ?? [];
-    this.lifecycleEpoch++; this.pendingPrompts.add(id); this.activity = 'running';
-    if (busy) this.queueAttachments.submitted(id, options.steer ? 'steering' : 'followUp', message, images);
+    this.lifecycleEpoch++;
+    if (busy) {
+      const queue = options.steer ? 'steering' : 'followUp';
+      this.queueAttachments.submitted(id, queue, message, images);
+      const delivery: QueuedDelivery = { submissionID: id, entry: null, queue, text: message, images, state: 'pending', projection: null, promotionID: null, withdrawn: false };
+      this.queuedDeliveries.push(delivery);
+      if (options.steer) this.projectSteer(delivery, 'sending');
+    } else { this.pendingPrompts.add(id); this.activity = 'running'; }
     this.unanchoredUserMessageID = null;
     if (!busy) this.advisorContinuationID = null;
     if (!busy) {
@@ -293,34 +321,30 @@ export class ThreadRuntime {
     }
     this.beginWork();
     this.state.status = { kind: 'ready', activity: this.activity }; this.state.error = null;
-    if (!busy) this.messagesChanged(); else this.changed();
+    if (!busy || options.steer) this.messagesChanged(); else this.changed();
     const fields: JsonRecord = { message };
     if (options.images?.length) fields.images = options.images;
     if (busy) fields.streamingBehavior = options.steer ? 'steer' : 'followUp';
     try {
       const result = await this.client.request('prompt', fields, { id, timeout: 60000 });
       if (generation !== this.generation) return false;
-      if (isRecord(result) && result.agentInvoked === false) {
-        this.queueAttachments.rejected(id);
-        this.applyQueueSnapshot(this.queueAttachments.snapshot());
-        this.discardOptimisticPrompt(id); this.pendingPrompts.delete(id); this.lifecycleEpoch++; await this.refreshState();
-      } else if (busy) {
-        this.queueAttachments.admitted(id, ++this.lifecycleEpoch);
-        this.refreshContextUsage();
-      }
+      // Admission is reduced synchronously before the request resolves so a
+      // later queue event cannot be attributed to an earlier prompt reply.
+      if (isRecord(result) && result.agentInvoked === false) await this.refreshState();
       if (generation !== this.generation) return false;
       this.onActivity?.(); this.changed(); return true;
     } catch (error) {
-      if (generation !== this.generation) return false;
+      if (generation !== this.generation || !isReady(this.state.status)) return false;
       if (!(error instanceof RpcError && error.kind === 'timeout')) {
         this.queueAttachments.rejected(id);
+        this.discardQueuedSubmission(id);
         this.applyQueueSnapshot(this.queueAttachments.snapshot());
         this.discardOptimisticPrompt(id); this.pendingPrompts.delete(id); this.lifecycleEpoch++;
       }
       this.state.error = sanitizeDiagnostic(error instanceof Error ? error.message : 'OMP rejected the prompt.');
       const state = await this.refreshState(5000).catch(() => null);
       if (generation !== this.generation) return false;
-      if (state?.isSettled === true) { this.discardOptimisticPrompt(id); this.pendingPrompts.delete(id); this.applyActivity(state); }
+      if (!busy && state?.isSettled === true) { this.discardOptimisticPrompt(id); this.pendingPrompts.delete(id); this.applyActivity(state); }
       this.changed(); return false;
     }
   }
@@ -335,22 +359,77 @@ export class ThreadRuntime {
   }
   promoteQueued(message: string): Promise<boolean> {
     const generation = this.generation;
+    if (!isReady(this.state.status)) return Promise.resolve(false);
+    const entry = this.queueAttachments.entries('followUp').find(item => item.text === message && !this.queuedDeliveries.some(delivery => delivery.entry === item && delivery.promotionID !== null));
+    if (!entry) return Promise.resolve(false);
+    const initialDelivery = this.queuedDeliveries.find(item => item.entry === entry);
+    if (!initialDelivery) return Promise.resolve(false);
+    let delivery: QueuedDelivery = initialDelivery;
+    const id = randomUUID();
+    const resolution = Promise.withResolvers<void>();
+    this.promotionResolutions.set(id, resolution);
+    let unresolved = false;
+    delivery.promotionID = id;
+    this.projectSteer(delivery, 'sending');
+    this.messagesChanged();
     const operation = this.queuePromotion.then(async () => {
-      if (generation !== this.generation || !isReady(this.state.status) || !this.state.queuedFollowUps.some(entry => entry.text === message)) return false;
+      if (generation !== this.generation || !isReady(this.state.status)) return false;
       const promotion = this.queueAttachments.promote(message);
+      if (!promotion?.entry) {
+        if (delivery.promotionID === id) {
+          delivery.promotionID = null;
+          if (delivery.state !== 'delivered') { delivery.projection = null; this.messagesChanged(); }
+        }
+        resolution.resolve(); this.promotionResolutions.delete(id);
+        return false;
+      }
+      // Native promotion targets the surviving FIFO occurrence at dispatch time.
+      if (promotion.entry !== delivery.entry) {
+        if (delivery.promotionID === id) {
+          delivery.promotionID = null;
+          if (delivery.state !== 'delivered') delivery.projection = null;
+        }
+        const surviving = this.queuedDeliveries.find(item => item.entry === promotion.entry);
+        if (!surviving || (surviving.promotionID !== null && surviving.promotionID !== id)) {
+          resolution.resolve(); this.promotionResolutions.delete(id);
+          this.queueAttachments.finishPromotion(promotion);
+          this.messagesChanged();
+          return false;
+        }
+        delivery = surviving;
+        delivery.promotionID = id;
+        this.projectSteer(delivery, 'sending');
+        this.messagesChanged();
+      }
       this.lifecycleEpoch++;
+      unresolved = false;
       try {
-        const result = await this.client.request('promote_queued_message', { message });
+        const result = await this.client.request('promote_queued_message', { message }, { id });
         if (generation !== this.generation) return false;
         if (!isRecord(result) || typeof result.promoted !== 'boolean') throw new RpcError('protocol', 'OMP returned an invalid queue promotion result.');
-        // Successful promotion emits its authoritative queue_update before the reply.
-        // A full-state read here delays acceptance and every later queue mutation.
-        if (!result.promoted) await this.refreshState();
-        if (generation === this.generation) this.changed();
+        resolution.resolve(); this.promotionResolutions.delete(id);
+        if (!result.promoted) {
+          delivery.projection = null;
+          await this.refreshState();
+        } else if (delivery.projection) delivery.projection.delivery.status = 'accepted';
+        this.messagesChanged();
         return result.promoted;
-      } finally { this.queueAttachments.finishPromotion(promotion); }
+      } catch (error) {
+        if (generation !== this.generation) return false;
+        unresolved = error instanceof RpcError && error.kind === 'timeout';
+        if (!unresolved && isReady(this.state.status)) delivery.projection = null;
+        this.messagesChanged();
+        throw error;
+      } finally {
+        if (unresolved) void resolution.promise.then(() => this.queueAttachments.finishPromotion(promotion));
+        else {
+          resolution.resolve(); this.promotionResolutions.delete(id);
+          this.queueAttachments.finishPromotion(promotion);
+        }
+        if (!unresolved && generation === this.generation && delivery.promotionID === id) delivery.promotionID = null;
+      }
     });
-    this.queuePromotion = operation.then(() => {}, () => {});
+    this.queuePromotion = operation.then(() => {}, () => {}).then(() => unresolved ? resolution.promise : undefined);
     return operation;
   }
   retractQueued(queue: 'steering' | 'followUp', message: string, imageRef: string | null): Promise<RetractedMessage | null> {
@@ -362,6 +441,8 @@ export class ThreadRuntime {
       const retraction = this.queueAttachments.prepareRetraction(queue, message, imageRef);
       if (!retraction) return null;
       let restored: RetractedMessage | null = null;
+      const delivery = this.queuedDeliveries.find(item => item.entry === retraction.entry);
+      if (delivery) delivery.withdrawn = true;
       this.lifecycleEpoch++;
       try {
         const result = await this.client.request('remove_queued_message', { queue, message: retraction.entry.text });
@@ -382,12 +463,14 @@ export class ThreadRuntime {
           // queue_update can release the tracked preview before this response.
           if (!images.length && result.imagesDropped === true) images = retraction.images.map(image => ({ ...image }));
           restored = { text: retraction.entry.text, images, imagesDropped: result.imagesDropped === true && !images.length };
+          if (delivery) delivery.projection = null;
           this.applyQueueSnapshot(this.queueAttachments.finishRetraction(retraction));
         }
       } catch (error) {
         if (generation === this.generation && isReady(this.state.status)) throw error;
       } finally {
         this.queueAttachments.cancelRetraction(retraction);
+        if (delivery && !restored) delivery.withdrawn = false;
         if (generation === this.generation && isReady(this.state.status)) {
           this.lifecycleEpoch++;
           try { await this.refreshState(); }
@@ -605,7 +688,7 @@ export class ThreadRuntime {
       this.activity = state.hasPendingAsyncWork === true && !running ? 'background' : this.activity === 'stopping' ? 'stopping' : 'running';
       if (isReady(this.state.status)) this.state.status = { kind: 'ready', activity: this.activity };
     }
-    if (isRecord(state.queuedMessages)) this.applyQueues(state.queuedMessages);
+    if (isRecord(state.queuedMessages)) this.applyQueues(state.queuedMessages, this.lifecycleEpoch);
   }
   private static modelChoice(value: Json | undefined): ModelChoice | null {
     if (!isRecord(value) || typeof value.provider !== 'string' || !value.provider || typeof value.id !== 'string' || !value.id) return null;
@@ -643,7 +726,7 @@ export class ThreadRuntime {
     switch (frame.type) {
       case 'message_start':
       case 'message_end': {
-        const confirmed = this.confirmOptimisticPrompt(frame);
+        const confirmed = this.confirmQueuedDelivery(frame) || this.confirmOptimisticPrompt(frame);
         this.anchorWork(frame);
         if (isRecord(frame.message) && frame.message.role === 'custom' && frame.message.customType === 'advisor') {
           const previous = this.workPeriods.at(-1);
@@ -677,6 +760,11 @@ export class ThreadRuntime {
       case 'agent_start': this.lifecycleEpoch++; this.beginWork(); this.activity = 'running'; if (isReady(this.state.status)) this.state.status = { kind: 'ready', activity: this.activity }; this.onActivity?.(); break;
       case 'agent_end': if (frame.awaitingAsyncWork === true) { this.beginWork(); this.activity = 'background'; if (isReady(this.state.status)) this.state.status = { kind: 'ready', activity: 'background' }; this.state.notice = 'Turn finished. Background work is still running.'; } this.refreshContextUsage(); break;
       case 'prompt_result': {
+        const queued = this.queuedDeliveries.find(delivery => delivery.submissionID === frame.id);
+        if (queued && (frame.status === 'error' || frame.status === 'aborted')) {
+          if (queued.state !== 'delivered') { queued.state = 'dropped'; this.messagesChanged(); }
+          this.refreshContextUsage();
+        }
         if (typeof frame.id !== 'string' || !this.pendingPrompts.delete(frame.id)) return;
         this.lifecycleEpoch++;
         if (frame.status === 'error') this.state.error = sanitizeDiagnostic(isRecord(frame.error) && typeof frame.error.message === 'string' ? frame.error.message : 'The model request failed. Check provider credentials in Terminal.');
@@ -700,14 +788,28 @@ export class ThreadRuntime {
         if (frame.command === 'get_messages' || frame.command === 'get_messages_page') return;
         if (frame.success === true && frame.command === 'compact') { this.refreshContextUsage(); return; }
         if (frame.success === false) this.state.error = sanitizeDiagnostic(typeof frame.error === 'string' ? frame.error : 'OMP rejected a command.');
+        if (frame.command === 'promote_queued_message' && typeof frame.id === 'string') {
+          const delivery = this.queuedDeliveries.find(item => item.promotionID === frame.id);
+          if (!delivery) return;
+          this.promotionResolutions.get(frame.id)?.resolve(); this.promotionResolutions.delete(frame.id);
+          delivery.promotionID = null;
+          if (frame.success === false || (isRecord(frame.data) && frame.data.promoted === false)) delivery.projection = null;
+          else if (delivery.projection) delivery.projection.delivery.status = 'accepted';
+          this.messagesChanged();
+          return;
+        }
         if (typeof frame.id !== 'string' || (frame.command !== 'prompt' && frame.command !== 'abort_and_prompt')) return;
         if (frame.success === false || (isRecord(frame.data) && frame.data.agentInvoked === false)) {
           this.queueAttachments.rejected(frame.id);
+          this.discardQueuedSubmission(frame.id);
           this.applyQueueSnapshot(this.queueAttachments.snapshot());
           this.pendingPrompts.delete(frame.id); this.discardOptimisticPrompt(frame.id);
           this.lifecycleEpoch++; void this.refreshState().then(() => this.changed()).catch(() => this.changed());
         } else if (frame.success === true) {
           this.queueAttachments.admitted(frame.id, ++this.lifecycleEpoch);
+          this.applyQueueSnapshot(this.queueAttachments.snapshot());
+          if (isRecord(frame.data) && frame.data.agentInvoked === true && this.queuedDeliveries.some(delivery => delivery.submissionID === frame.id)) this.pendingPrompts.add(frame.id);
+          this.acceptQueuedSubmission(frame.id);
           this.refreshContextUsage();
         } else return;
         break;
@@ -742,6 +844,62 @@ export class ThreadRuntime {
       default: return;
     }
     this.changed();
+  }
+  private projectSteer(delivery: QueuedDelivery, status: 'sending' | 'accepted'): boolean {
+    const projection = delivery.projection;
+    const imageRef = delivery.entry?.imageRef ?? (delivery.images.length ? delivery.submissionID : null);
+    if (projection) {
+      const changed = projection.delivery.status !== status || projection.delivery.queue !== delivery.queue || projection.delivery.imageRef !== imageRef;
+      projection.delivery = { kind: 'steer', status, queue: delivery.queue, imageRef };
+      return changed;
+    }
+    delivery.projection = {
+      id: `pending-steer-${randomUUID()}`, role: 'user', text: delivery.text, images: delivery.images.map(image => ({ ...image })),
+      thinking: '', error: null, isStreaming: false, toolIDs: [],
+      delivery: { kind: 'steer', status, queue: delivery.queue, imageRef },
+    };
+    return true;
+  }
+  private acceptQueuedSubmission(id: string): void {
+    const delivery = this.queuedDeliveries.find(item => item.submissionID === id);
+    if (delivery?.projection && delivery.state !== 'delivered') {
+      delivery.projection.delivery.status = 'accepted';
+      this.messagesChanged();
+    }
+  }
+  private discardQueuedSubmission(id: string): void {
+    const delivery = this.queuedDeliveries.find(item => item.submissionID === id);
+    if (!delivery || delivery.state === 'delivered') return;
+    delivery.projection = null;
+    delivery.state = 'dropped';
+    this.messagesChanged();
+  }
+  private confirmQueuedDelivery(frame: JsonRecord): boolean {
+    if (!isRecord(frame.message) || typeof frame.messageId !== 'string' ||
+        !frame.messageId || this.store.messages.has(frame.messageId) || frame.message.content === undefined) return false;
+    const skillChip = frame.message.role === 'custom' && frame.message.customType === 'skill-prompt' &&
+      frame.message.attribution === 'user' && frame.message.display !== false && isRecord(frame.message.details) &&
+      typeof frame.message.details.__queueChipText === 'string' ? frame.message.details.__queueChipText : null;
+    if (frame.message.role !== 'user' && skillChip === null) return false;
+    const content = frame.message.content;
+    const text = typeof content === 'string' ? content : Array.isArray(content) ? content.flatMap(block => isRecord(block) && block.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n\n') : '';
+    const images = Array.isArray(content) ? content.filter(isImageContent) : [];
+    const candidates = this.queuedDeliveries.filter(delivery => delivery.state !== 'delivered' && delivery.state !== 'dropped').sort((left, right) => Number(left.queue === 'followUp') - Number(right.queue === 'followUp'));
+    // Queue removal can precede native delivery, including an intervening state
+    // read. Only settlement or a terminal result ends FIFO attribution.
+    const removed = candidates.filter(delivery => delivery.state === 'removed');
+    const sameContent = (delivery: QueuedDelivery): boolean => delivery.text === text && delivery.images.length === images.length &&
+      delivery.images.every((image, index) => image.mimeType === images[index]?.mimeType && image.data === images[index]?.data);
+    const matchesSkill = (delivery: QueuedDelivery): boolean => (delivery.entry?.chip ?? delivery.text) === skillChip;
+    const delivery = skillChip !== null ? removed.find(matchesSkill) ?? candidates.find(matchesSkill) :
+      removed.find(sameContent) ?? candidates.find(sameContent) ?? removed[0] ??
+        (!this.optimisticPrompt || frame.message.steering === true ? candidates.find(item => item.queue === 'steering') ?? candidates.find(item => item.state === 'queued') : undefined);
+    if (!delivery) return false;
+    delivery.state = 'delivered';
+    if (delivery.projection) for (const period of this.workPeriods) if (period.messageID === delivery.projection.id) period.messageID = frame.messageId;
+    delivery.projection = null;
+    delivery.images = [];
+    return true;
   }
   private confirmOptimisticPrompt(frame: JsonRecord): boolean {
     const pending = this.optimisticPrompt;
@@ -793,6 +951,12 @@ export class ThreadRuntime {
     if (period?.endedAt === null) period.endedAt = Math.max(period.startedAt, Date.now());
   }
   private settle(): void {
+    let retired = false;
+    for (const delivery of this.queuedDeliveries) if (delivery.state === 'removed' || (delivery.state === 'pending' && delivery.projection?.delivery.status === 'accepted')) {
+      delivery.state = 'dropped';
+      retired ||= delivery.projection !== null;
+    }
+    if (retired) this.messagesChanged();
     if (this.optimisticPrompt) this.discardOptimisticPrompt(this.optimisticPrompt.id);
     this.finishWork();
     this.activity = 'idle'; if (isReady(this.state.status)) this.state.status = { kind: 'ready', activity: 'idle' };
@@ -806,11 +970,52 @@ export class ThreadRuntime {
     return this.applyQueueSnapshot(this.queueAttachments.reconcile(steering, followUp, observedAt));
   }
   private applyQueueSnapshot({ steering, followUp }: QueueSnapshot): boolean {
-    if (steering.length === this.state.queuedSteers.length && followUp.length === this.state.queuedFollowUps.length &&
-      steering.every((entry, index) => entry.text === this.state.queuedSteers[index]?.text && entry.imageCount === this.state.queuedSteers[index]?.imageCount && entry.imageRef === this.state.queuedSteers[index]?.imageRef) &&
-      followUp.every((entry, index) => entry.text === this.state.queuedFollowUps[index]?.text && entry.imageCount === this.state.queuedFollowUps[index]?.imageCount && entry.imageRef === this.state.queuedFollowUps[index]?.imageRef)) return false;
+    const changed = steering.length !== this.state.queuedSteers.length || followUp.length !== this.state.queuedFollowUps.length ||
+      steering.some((entry, index) => entry.text !== this.state.queuedSteers[index]?.text || entry.imageCount !== this.state.queuedSteers[index]?.imageCount || entry.imageRef !== this.state.queuedSteers[index]?.imageRef) ||
+      followUp.some((entry, index) => entry.text !== this.state.queuedFollowUps[index]?.text || entry.imageCount !== this.state.queuedFollowUps[index]?.imageCount || entry.imageRef !== this.state.queuedFollowUps[index]?.imageRef);
     this.state.queuedSteers = steering; this.state.queuedFollowUps = followUp;
-    return true;
+    const visible = new Set<QueuedDelivery>();
+    let messagesChanged = false;
+    for (const queue of ['steering', 'followUp'] as const) for (const entry of this.queueAttachments.entries(queue)) {
+      let delivery = this.queuedDeliveries.find(item => item.entry === entry || (entry.submission !== null && item.submissionID === entry.submission));
+      if (!delivery) {
+        if (entry.submission === null && this.queueAttachments.hasUnbound(queue)) continue;
+        delivery = { submissionID: entry.submission, entry, queue, text: entry.text, images: entry.imageRef ? this.queueAttachments.getImages(entry.imageRef) : [], state: 'queued', projection: null, promotionID: null, withdrawn: false };
+        this.queuedDeliveries.push(delivery);
+      }
+      delivery.entry = entry; delivery.queue = queue;
+      if (delivery.text !== entry.text) {
+        delivery.text = entry.text;
+        if (delivery.projection) { delivery.projection.text = entry.text; messagesChanged = true; }
+      }
+      visible.add(delivery);
+      if (delivery.state === 'delivered' || delivery.state === 'dropped') continue;
+      if (delivery.state !== 'queued') { delivery.state = 'queued'; messagesChanged ||= delivery.projection !== null; }
+      if (queue === 'steering') {
+        if (delivery.promotionID) {
+          this.promotionResolutions.get(delivery.promotionID)?.resolve();
+          this.promotionResolutions.delete(delivery.promotionID);
+        }
+        messagesChanged = this.projectSteer(delivery, 'accepted') || messagesChanged;
+      } else if (delivery.projection) {
+        delivery.projection.delivery.queue = queue;
+        delivery.projection.delivery.imageRef = entry.imageRef;
+      }
+    }
+    for (const delivery of this.queuedDeliveries) if (delivery.state === 'queued' && !visible.has(delivery)) {
+      delivery.state = 'removed';
+      if (delivery.promotionID) {
+        this.promotionResolutions.get(delivery.promotionID)?.resolve();
+        this.promotionResolutions.delete(delivery.promotionID);
+      }
+      messagesChanged ||= delivery.projection !== null;
+    }
+    for (let index = this.queuedDeliveries.length - 1; index >= 0; index--) {
+      const delivery = this.queuedDeliveries[index];
+      if (delivery && !visible.has(delivery) && (delivery.state === 'delivered' || (delivery.state === 'dropped' && !delivery.projection))) this.queuedDeliveries.splice(index, 1);
+    }
+    if (messagesChanged) this.messagesChanged();
+    return changed;
   }
   private reduceSubagent(value: Json | undefined): void {
     if (!isRecord(value)) return;
@@ -916,6 +1121,14 @@ export class ThreadRuntime {
     await this.client.shutdown();
   }
   private interrupt(): void {
+    for (const resolution of this.promotionResolutions.values()) resolution.resolve();
+    this.promotionResolutions.clear();
+    this.queuePromotion = Promise.resolve();
+    for (const delivery of this.queuedDeliveries) if (delivery.state !== 'delivered') {
+      delivery.state = 'dropped';
+      if (delivery.projection) delivery.projection.delivery.status = 'accepted';
+    }
+    if (this.queuedDeliveries.some(delivery => delivery.projection)) this.messagesChanged();
     if (this.optimisticPrompt) this.discardOptimisticPrompt(this.optimisticPrompt.id);
     this.finishWork();
     this.modelRefresh?.abort(); this.modelRefresh = null; this.historyBuffer = null; this.pendingPrompts.clear();

@@ -14,7 +14,7 @@ import { TextShimmer } from './shimmer';
 import { SurfacePresence } from './surface-presence';
 import ompLogo from './omp-logo.svg';
 
-interface MessageView { node: HTMLElement; body: HTMLElement; images: MessageImages; reasoning: HTMLElement; error: HTMLElement; value: ChatMessage; advisors: readonly ChatMessage[] | undefined }
+interface MessageView { node: HTMLElement; body: HTMLElement; images: MessageImages; reasoning: HTMLElement; error: HTMLElement; delivery: HTMLElement | null; deliveryStatus: HTMLElement | null; historicalEdit: HTMLButtonElement | null; value: ChatMessage; advisors: readonly ChatMessage[] | undefined }
 interface ToolView { node: HTMLDetailsElement; summary: HTMLElement; paths: HTMLElement; detail: HTMLElement; input: HTMLElement; output: HTMLElement; value: ToolActivity }
 interface ActivityView { node: HTMLDetailsElement; label: HTMLElement; current: HTMLElement; state: HTMLElement | null; list: HTMLElement }
 
@@ -81,7 +81,10 @@ export class Conversation {
   private readonly work = new WorkProgress(this.content);
   private readonly shimmer = new TextShimmer();
   private readonly imageLoaded = (): void => { if (this.follow) this.scroll.scrollTop = this.scroll.scrollHeight; };
-  private readonly queued = new QueuedMessages(this.imageLoaded);
+  private readonly queued = new QueuedMessages(this.imageLoaded, () => this.followLatest(), id => {
+    const view = this.messages.get(id);
+    return view?.delivery ? { node: view.node, delivery: view.delivery } : undefined;
+  });
   private readonly sentEditor = new SentMessageEditor(() => this.node.isConnected && !this.node.hidden, () => this.followLatest());
   readonly pending = this.queued.node;
   set onEditQueued(callback: ((value: QueuedEditRequest) => Promise<void>) | null) { this.queued.onEdit = callback; }
@@ -293,22 +296,29 @@ export class Conversation {
         reasoning.setAttribute('aria-label', 'Reasoning');
         const error = element('p', 'error-text');
         const images = new MessageImages(this.imageLoaded);
+        let delivery: HTMLElement | null = null, deliveryStatus: HTMLElement | null = null;
+        let historicalEdit: HTMLButtonElement | null = null;
         node.append(reasoning, body, images.node, error); staged.append(node);
         if (message.role === 'user') {
+          delivery = element('div', 'message-delivery');
+          deliveryStatus = element('span', 'muted'); deliveryStatus.setAttribute('role', 'status');
+          delivery.append(deliveryStatus); delivery.hidden = true; node.append(delivery);
           const messageID = message.id;
           const control = iconButton('copy', 'Copy message', () => {
-            if (!threadID) return;
+            const current = this.messages.get(messageID);
+            if (!threadID || this.threadID !== threadID || !current) return;
             return copy(() => request({ kind: 'copy-message', id: threadID, messageID }), control);
           }, 'user-message-action user-message-copy');
           const edit = iconButton('edit', 'Edit message', () => {
             const current = this.messages.get(messageID);
-            if (!threadID || !current) return;
+            if (!threadID || this.threadID !== threadID || !current || current.value.delivery || current.value.id.startsWith('pending-steer-')) return;
             this.pauseFollowing();
             this.sentEditor.open({ threadID, message: current.value, node, body, control: edit });
           }, 'user-message-action user-message-edit');
+          historicalEdit = edit;
           node.append(edit, control);
         }
-        view = { node, body, images, reasoning, error, value: message, advisors }; this.messages.set(message.id, view);
+        view = { node, body, images, reasoning, error, delivery, deliveryStatus, historicalEdit, value: message, advisors }; this.messages.set(message.id, view);
         if (message.text || message.customType) {
           if (!renderBackgroundMessage(body, message, advisors)) this.renderText(body, message.text, streaming && this.hydrated);
         }
@@ -330,6 +340,14 @@ export class Conversation {
         if (view.error.textContent !== (message.error ?? '')) view.error.textContent = message.error;
         if (view.error.hidden !== !message.error) view.error.hidden = !message.error;
         view.node.classList.toggle('streaming', message.isStreaming);
+        const delivery = message.delivery;
+        if (view.delivery) view.delivery.hidden = !delivery;
+        if (view.historicalEdit) view.historicalEdit.hidden = !!delivery || message.id.startsWith('pending-steer-');
+        if (delivery && view.deliveryStatus) {
+          view.node.dataset.delivery = delivery.status;
+          view.deliveryStatus.textContent = delivery.status === 'sending' ? 'Sending…' : 'Queued to interrupt';
+          view.deliveryStatus.title = delivery.status === 'sending' ? 'Sending this steer to the engine.' : 'Accepted by the engine. Waiting for its next interruption point.';
+        } else delete view.node.dataset.delivery;
       }
       const toolOnly = toolOnlyMessage(message);
       if (view.node.hidden !== toolOnly) view.node.hidden = toolOnly;

@@ -11,7 +11,7 @@ export interface ThreadRecord {
 export interface Manifest { projects: Project[]; threads: ThreadRecord[]; selectedThreadID: string | null; sidebarVisible: boolean }
 export interface Preferences { executableOverride: string; appearance: 'system' | 'light' | 'dark'; defaultProjectPath: string; sidebarWidth: number }
 export interface ModelChoice { id: string; provider: string; modelID: string; name: string; supportsImages: boolean }
-export interface ChatMessage { id: string; role: string; text: string; thinking: string; error: string | null; isStreaming: boolean; toolIDs: string[]; images?: ImageContent[]; customType?: string; details?: JsonRecord; display?: boolean }
+export interface ChatMessage { id: string; role: string; text: string; thinking: string; error: string | null; isStreaming: boolean; toolIDs: string[]; images?: ImageContent[]; customType?: string; details?: JsonRecord; display?: boolean; delivery?: { kind: 'steer'; status: 'sending' | 'accepted'; queue: 'followUp' | 'steering'; imageRef: string | null } }
 export interface ToolActivity { id: string; name: string; target: string; paths?: string[]; detail: string; input?: string; output: string; state: 'pending' | 'running' | 'succeeded' | 'failed' | 'interrupted'; startedAt: number; endedAt: number | null }
 export interface DialogRequest { id: string; method: 'confirm' | 'select' | 'input' | 'editor' | 'ask'; title: string; message: string; frame: JsonRecord; deadline: number | null; error: string | null }
 export interface SubagentActivity { id: string; title: string; status: string; detail: string; messageID: string | null }

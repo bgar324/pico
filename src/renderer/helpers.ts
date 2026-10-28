@@ -28,6 +28,12 @@ function isMessage(value: unknown): value is ChatMessage {
   if (!isRecord(value) || value.customType !== undefined && typeof value.customType !== 'string' || value.details !== undefined && (!isRecord(value.details) || !isJson(value.details))) return false;
   if (value.display !== undefined && typeof value.display !== 'boolean') return false;
   if (value.images !== undefined && (!Array.isArray(value.images) || !value.images.every(isImageContent))) return false;
+  if (value.delivery !== undefined) {
+    const delivery = value.delivery;
+    if (value.role !== 'user' || !isRecord(delivery) || delivery.kind !== 'steer' || (delivery.status !== 'sending' && delivery.status !== 'accepted') ||
+      (delivery.queue !== 'followUp' && delivery.queue !== 'steering') ||
+      (delivery.imageRef !== null && (typeof delivery.imageRef !== 'string' || !delivery.imageRef || delivery.imageRef.includes('\0')))) return false;
+  }
   return isRecord(value) && typeof value.id === 'string' && typeof value.role === 'string' && typeof value.text === 'string' && typeof value.thinking === 'string' && (value.error === null || typeof value.error === 'string') && typeof value.isStreaming === 'boolean' && Array.isArray(value.toolIDs) && value.toolIDs.every(id => typeof id === 'string');
 }
 function isTool(value: unknown): value is ToolActivity {

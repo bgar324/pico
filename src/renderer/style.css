@@ -173,6 +173,8 @@ details > summary::marker { content:''; }
 @media(hover:none) { .user-message-action { opacity:1; pointer-events:auto; } }
 .user-message.is-editing { width:70%; border-radius:16px; }
 .user-message.is-editing > .markdown,.user-message.is-editing > .user-message-action { display:none; }
+.message-delivery { margin-top:4px; font-size:11px; line-height:18px; text-align:right; }
+.message-delivery > .error-text { margin:4px 0 0; font-size:12px; }
 .sent-message-editor { display:block; width:100%; min-height:64px; max-height:240px; field-sizing:content; resize:none; overflow:auto; overscroll-behavior:contain; padding:0; border:0; border-radius:0; background:transparent; font:inherit; line-height:inherit; }
 .sent-message-editor:read-only { opacity:.7; }
 .sent-message-edit-footer { margin-top:10px; }

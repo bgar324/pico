@@ -10,6 +10,7 @@ import { renderMarkdown } from '../src/renderer/markdown';
 import { checkManualStreamingScroll } from './scroll-checks';
 import { checkStreamingPresentation } from './streaming-checks';
 import { checkCodeCopyReconciliation } from './code-copy-checks';
+import { checkSteeringProjections } from './steering-checks';
 
 function verify(condition: unknown, message: string): void { if (!condition) throw new Error(message); }
 async function frame(): Promise<void> {
@@ -812,6 +813,7 @@ export async function checkLoadingBehavior(): Promise<string[]> {
     outcomes.push(await checkComposerImagePreview(view, host));
     outcomes.push(await checkComposerDrop(host));
     outcomes.push(await checkQueuedEditing(view, host));
+    outcomes.push(await checkSteeringProjections(view, host, source('steering-projections')));
     outcomes.push(await checkSidebarTransitions());
     outcomes.push(...await checkMainFrameStates());
     const history = source('loading'); view.update(history, history.id);
