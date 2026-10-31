@@ -173,7 +173,7 @@ Screenshots, captured sessions, and machine-specific results under `Evidence/` a
 
 ## App icon and dependencies
 
-The app icon is a locally rendered, square-ended pi mark in visible medium gray on a dark rounded tile. Its compact 9:8 proportions and optical centering account for the longer right leg. Its source is `scripts/make-icon.swift`. Packaging regenerates all macOS icon sizes and `assets/Pico.icns`; `npm run icon` regenerates the icon independently.
+The app icon uses the supplied white organic burst on black, stored in `assets/Pico-source.png`. `scripts/make-icon.swift` scales the artwork onto a rounded macOS tile with transparent outer padding. Packaging regenerates all macOS icon sizes and `assets/Pico.icns`; `npm run icon` regenerates the icon independently.
 
 Interface glyphs come from MIT-licensed [Tabler Icons](https://tabler.io/icons), except the project folder pair and activity spinner restored from the Codex desktop reference. Those filled paths are kept separately in `src/renderer/assets/`; generic folder action icons remain Tabler. The activity spinner uses Codex's muted ring, three-quarter foreground arc, and 2-second stepped rotation, respecting reduced motion. Motion uses [Motion](https://motion.dev/)'s framework-neutral DOM runtime, not React. Markdown uses [Marked](https://marked.js.org/), [DOMPurify](https://github.com/cure53/DOMPurify), and [KaTeX](https://katex.org/) for math. Third-party license notices are included in `THIRD_PARTY_NOTICES.md`.
 
