@@ -56,6 +56,17 @@ export async function checkSentMessages(view: Conversation): Promise<string> {
   verify(Math.abs(bubble.getBoundingClientRect().width - available) < 1, 'Long sent message remains narrower than the reading column.');
   const bounds = bubble.getBoundingClientRect(), textBounds = body().getBoundingClientRect();
   verify(textBounds.top >= bounds.top && textBounds.bottom <= bounds.bottom && view.scroll.scrollWidth <= view.scroll.clientWidth + 1, 'Long sent message clips vertically or overflows the conversation.');
+  const host = view.node.parentElement;
+  if (!host) throw new Error('Missing sent-message host.');
+  const originalStyle = host.style.cssText;
+  try {
+    host.style.width = '600px'; host.style.right = 'auto'; host.style.containerType = 'inline-size';
+    await frame();
+    const compactStyle = getComputedStyle(view.content);
+    const compactWidth = view.content.getBoundingClientRect().width - parseFloat(compactStyle.paddingLeft) - parseFloat(compactStyle.paddingRight);
+    verify(Math.abs(bubble.getBoundingClientRect().width - compactWidth) < 1 && view.scroll.scrollWidth <= view.scroll.clientWidth + 1, 'Compact sent message retains a width limit or overflows.');
+  } finally { host.style.cssText = originalStyle; }
+  await frame();
   view.update({ ...runtime, revision: 3, messages: [user] }, runtime.id);
   formatted();
   view.activate();
