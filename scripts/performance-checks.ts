@@ -320,7 +320,8 @@ function checkActivityPresentation(view: Conversation): string {
   if (!orphanGroup || !evalNode) throw new Error('Missing Eval activity.');
   verify(evalNode.querySelector('.tool-name')?.textContent === 'Inspecting renderer state' && !evalNode.querySelector('.tool-target')?.textContent && orphanGroup.querySelector('.activity-current')?.textContent === 'Inspecting renderer state', 'Eval purpose was missing or prefixed with the tool name.');
   verify(orphanGroup.querySelector('summary')?.getAttribute('aria-description') === 'Running · Inspecting renderer state', 'Eval purpose was missing from its accessible running announcement.');
-  orphanGroup.open = true; evalNode.open = true;
+  orphanGroup.open = true;
+  verify(evalNode.open && getComputedStyle(evalNode.querySelector('summary')!).display === 'none', 'A single tool required a second disclosure to reveal its blocks.');
   const owner = { role: 'assistant', content: [
     { type: 'thinking', thinking: 'Keep the explanation readable.' }, { type: 'text', text: 'I am checking the project.' },
     { type: 'toolCall', id: 'ask', name: 'ask', arguments: {} },
@@ -335,7 +336,8 @@ function checkActivityPresentation(view: Conversation): string {
   view.update(runtime, runtime.id);
   const group = view.content.querySelector<HTMLDetailsElement>('.activity-group');
   if (!group) throw new Error('Missing owned Activity disclosure.');
-  verify(group && view.content.querySelectorAll('.activity-group').length === 1 && group.open && evalNode.open && evalNode.isConnected, 'Resolving tool ownership lost or duplicated its Activity disclosure.');
+  verify(view.content.querySelectorAll('.activity-group').length === 1 && group.open && !evalNode.open && evalNode.isConnected, 'Resolving tool ownership lost Activity or retained an auto-opened tool in a multi-tool group.');
+  verify(getComputedStyle(evalNode.querySelector('summary')!).display !== 'none', 'A multi-tool group retained a hidden individual disclosure.');
   verify(!view.content.querySelector('.message .tool,:scope > .tool') && view.content.querySelector('[data-message-id="owner"]')?.textContent?.includes('I am checking the project.'), 'Tools escaped Activity or hid assistant prose/reasoning.');
   verify(group.querySelector('.activity-current.work-shimmer') && !group.querySelector('.activity-state') && group.querySelector('.activity-summary')?.getAttribute('aria-description')?.startsWith('Running'), 'Activity lost its current running status or retained a right-hand spinner.');
   store.consume({ type: 'tool_execution_end', toolCallId: 'bash', toolName: 'bash', result: { content: [{ type: 'text', text: 'Checks passed' }] } });

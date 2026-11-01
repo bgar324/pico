@@ -126,11 +126,12 @@ export async function checkMainFrameStates(): Promise<string[]> {
     verify(document.activeElement === editor, 'Removing focused activity left keyboard focus on the document body.');
 
     const disclosureTool = { id: 'disclosure-tool', name: 'glob', target: 'src/**/*.ts', detail: 'Inspect source files', output: 'Found source files.', state: 'succeeded', startedAt: 0, endedAt: 1000 } satisfies RuntimeSnapshot['tools'][number];
+    const companionTool = { ...disclosureTool, id: 'companion-tool' };
     runtime = { ...runtime, revision: runtime.revision + 1, messages: [
-      { id: 'disclosure-owner', role: 'assistant', text: '', thinking: '', toolIDs: [disclosureTool.id], error: null, isStreaming: false },
+      { id: 'disclosure-owner', role: 'assistant', text: '', thinking: '', toolIDs: [disclosureTool.id, companionTool.id], error: null, isStreaming: false },
       { id: 'disclosure-advisor', role: 'custom', customType: 'advisor', text: '', thinking: '', toolIDs: [], error: null, isStreaming: false, details: { notes: [{ note: 'Keep the disclosure state through updates.', severity: 'concern' }] } },
       { id: 'disclosure-rule', role: 'developer', text: '<system-reminder reason="rule_violation" rule="ts-no-tiny-functions" path="builtin-defaults:ts-no-tiny-functions.md">Keep the rule instructions readable.</system-reminder>', thinking: '', toolIDs: [], error: null, isStreaming: false },
-    ], tools: [disclosureTool] };
+    ], tools: [disclosureTool, companionTool] };
     view.update(runtime, runtime.id);
     const disclosures = ['.activity-group', '.tool', '.advisor-group', '.notice-rule-details'];
     for (const selector of disclosures) {
@@ -157,7 +158,7 @@ export async function checkMainFrameStates(): Promise<string[]> {
       verify(!disclosure.open && getComputedStyle(caret).opacity === '0', 'Closing a row did not restore its idle caret behavior.');
       control.click(); await settle();
     }
-    runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...disclosureTool, output: 'Updated source results.' }],
+    runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...disclosureTool, output: 'Updated source results.' }, companionTool],
       messages: runtime.messages.map(message => message.customType === 'advisor' ? { ...message, details: { notes: [{ note: 'A higher-severity update.', severity: 'blocker' }] } } : message.role === 'developer' ? { ...message, details: { refreshed: true } } : message) };
     view.update(runtime, runtime.id); editor.focus(); await settle();
     for (const selector of disclosures) {
@@ -168,7 +169,7 @@ export async function checkMainFrameStates(): Promise<string[]> {
     const editPaths = ['/site/index.html', '/site/projects/index.html', '/site/blog/index.html', '/site/blog/first/index.html', '/site/blog/second/index.html'];
     const editTool = { ...disclosureTool, name: 'edit', paths: editPaths, target: editPaths.join(', '), detail: 'Raw patch diagnostic sentinel.', input: 'Original patch input.', output: 'Original edit output.' };
     for (const state of ['pending', 'running', 'succeeded', 'failed', 'interrupted'] satisfies RuntimeSnapshot['tools'][number]['state'][]) {
-      runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...editTool, state }] };
+      runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...editTool, state }, companionTool] };
       view.update(runtime, runtime.id);
       const row = view.content.querySelector<HTMLDetailsElement>('.tool'), summary = row?.querySelector('summary');
       if (!row || !summary) throw new Error('Missing compact Edit row.');
@@ -186,14 +187,14 @@ export async function checkMainFrameStates(): Promise<string[]> {
     verify(view.content.querySelector('.tool.find-match'), 'Find lost full Edit paths after stripping their common directory.');
     view.findInput.value = ''; view.findInput.dispatchEvent(new Event('input'));
     const longPath = `/site/${'long-filename-'.repeat(80)}.html`;
-    runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...editTool, paths: [longPath], state: 'succeeded' }] };
+    runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...editTool, paths: [longPath], state: 'succeeded' }, companionTool] };
     view.update(runtime, runtime.id);
     const pathTarget = view.content.querySelector<HTMLElement>('.tool-target');
     verify(pathTarget?.textContent === longPath && pathTarget.title === longPath && pathTarget.scrollWidth > pathTarget.clientWidth
       && getComputedStyle(pathTarget).whiteSpace === 'nowrap' && getComputedStyle(pathTarget).textOverflow === 'ellipsis',
     'A single long Edit path did not retain its authoritative path and single-line ellipsis.');
     verify(view.content.querySelector('.tool-name')?.textContent === 'Edited', 'A completed single-file edit retained an active label.');
-    runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...editTool, paths: ['src/renderer/first.ts', 'src/renderer/second.ts'], state: 'running' }] };
+    runtime = { ...runtime, revision: runtime.revision + 1, tools: [{ ...editTool, paths: ['src/renderer/first.ts', 'src/renderer/second.ts'], state: 'running' }, companionTool] };
     view.update(runtime, runtime.id);
     verify(Array.from(view.content.querySelectorAll('.tool-path')).map(path => path.textContent).join('|') === 'src/renderer/first.ts|src/renderer/second.ts',
       'Relative Edit paths lost their project directory context.');

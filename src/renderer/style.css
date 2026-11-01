@@ -253,6 +253,8 @@ pre,code { font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace; font-
 .activity-label { margin-inline-end:8px; flex-shrink:0; }
 .activity-current { display:block; min-width:0; flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font:inherit; }
 .activity-list { padding-left:24px; padding-bottom:4px; }
+.activity-group.single-tool > .activity-list { padding:0; }
+.tool.single-tool > summary { display:none; }
 .tool { font-size:12px; line-height:20px; margin:2px 0; color:var(--muted); }
 .tool > summary { align-items:center; gap:8px; min-height:28px; padding:4px 0; }
 .tool-name { color:inherit; }

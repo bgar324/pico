@@ -378,6 +378,20 @@ export class Conversation {
       for (const tool of unattached) this.updateTool(tool, group.list);
     }
     for (const [group, actions] of activityTools) {
+      const single = actions.length === 1;
+      group.node.classList.toggle('single-tool', single);
+      for (const tool of actions) {
+        const node = this.tools.get(tool.id)?.node;
+        if (!node) continue;
+        if (single && !node.classList.contains('single-tool')) {
+          node.classList.toggle('auto-opened', !node.open);
+          node.open = true;
+        } else if (!single && node.classList.contains('auto-opened')) {
+          node.open = false;
+          node.classList.remove('auto-opened');
+        }
+        node.classList.toggle('single-tool', single);
+      }
       const label = `Activity · ${actions.length} ${actions.length === 1 ? 'action' : 'actions'}`;
       if (group.label.dataset.label !== label) {
         group.label.dataset.label = label; group.label.title = label; group.label.setAttribute('role', 'img'); group.label.setAttribute('aria-label', label);
