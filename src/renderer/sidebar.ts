@@ -17,6 +17,8 @@ interface ThreadView {
   status: HTMLElement; menu: HTMLButtonElement; value: ThreadRecord;
 }
 interface SidebarMenu { anchor: HTMLElement; row: HTMLElement | null; previousFocus: Element | null }
+const folderNames = new Intl.Collator(undefined, { sensitivity: 'base' });
+const folderName = (path: string): string => path.split('/').filter(Boolean).at(-1) ?? path;
 
 export class Sidebar {
   readonly node = element('aside', 'sidebar');
@@ -96,11 +98,11 @@ export class Sidebar {
       this.titles.untrack(view.labelViewport); view.node.remove(); this.threads.delete(id);
     }
     const groups: HTMLElement[] = [];
-    for (const project of manifest.projects) {
+    for (const project of manifest.projects.toSorted((a, b) => folderNames.compare(folderName(a.path), folderName(b.path)) || folderNames.compare(a.path, b.path))) {
       let view = this.projects.get(project.id);
       if (!view) { view = this.createProject(project); this.projects.set(project.id, view); }
       view.value = project;
-      const name = project.path.split('/').filter(Boolean).at(-1) ?? project.path;
+      const name = folderName(project.path);
       if (view.label.textContent !== name) view.label.textContent = name;
       view.toggle.title = project.path;
       view.menu.title = `${name} actions`; view.menu.setAttribute('aria-label', view.menu.title);

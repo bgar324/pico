@@ -27,14 +27,17 @@ export async function checkSidebarTransitions(): Promise<string> {
       messages: [], tools: [], dialogs: [], subagents: [], todoPhases: [], queuedFollowUps: [], queuedSteers: [], error: null, notice: null,
     };
     sidebar.update(app, new Map()); sidebar.setVisible(true); await frame(); await frame();
-    const toggle = sidebar.node.querySelector<HTMLButtonElement>('.project-name');
-    const folder = sidebar.node.querySelector<HTMLElement>('.project-threads');
+    verify(Array.from(sidebar.node.querySelectorAll('.project-name')).map(node => node.textContent).join(',') === 'Other,Project', 'Folders did not render alphabetically by folder name.');
+    verify(app.manifest.projects[0]?.id === 'one', 'Rendering reordered the saved project array.');
+    const project = sidebar.node.querySelector<HTMLElement>('.project-name[title="/sidebar/Project"]')?.closest('.project-group');
+    const toggle = project?.querySelector<HTMLButtonElement>('.project-name');
+    const folder = project?.querySelector<HTMLElement>('.project-threads');
     const selected = sidebar.node.querySelector<HTMLButtonElement>('.thread-title[data-thread-id="sidebar-7"]');
     if (!toggle || !folder || !selected) throw new Error('Sidebar did not preserve a selected thread beyond the initial visible page.');
     const initialHeight = folder.getBoundingClientRect().height;
     verify(initialHeight > 0 && !folder.inert, 'Restored expanded folder did not open immediately.');
-    const status = sidebar.node.querySelector<HTMLElement>('.project-status');
-    const otherStatus = sidebar.node.querySelector<HTMLElement>('.project-group:nth-child(2) .project-status');
+    const status = project?.querySelector<HTMLElement>('.project-status');
+    const otherStatus = sidebar.node.querySelector<HTMLElement>('.project-name[title="/sidebar/Other"]')?.closest('.project-group')?.querySelector<HTMLElement>('.project-status');
     if (!status || !otherStatus) throw new Error('Missing project status indicators.');
     sidebar.update(app, new Map([[runtime.id, runtime]]));
     verify(!status.checkVisibility(), 'Expanded folders duplicated thread activity on the folder row.');
@@ -60,7 +63,7 @@ export async function checkSidebarTransitions(): Promise<string> {
     await settled(() => Math.abs(folder.getBoundingClientRect().height - initialHeight) < 0.5);
     verify(!folder.inert && toggle.getAttribute('aria-expanded') === 'true' && selected.isConnected, 'Rapid folder reversal lost the final open state or recreated the selected row.');
     verify(!status.checkVisibility(), 'Opening a running folder left a duplicate folder spinner.');
-    const more = sidebar.node.querySelector<HTMLButtonElement>('.project-show-more');
+    const more = project?.querySelector<HTMLButtonElement>('.project-show-more');
     more?.click();
     await settled(() => folder.getBoundingClientRect().height > initialHeight + 50);
     verify(sidebar.node.querySelectorAll('.thread-row').length === 8, 'Show more dropped or duplicated saved conversations.');

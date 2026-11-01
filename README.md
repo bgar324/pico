@@ -91,6 +91,8 @@ Idle conversations reconnect to discover updated models without changing the sel
 
 The sidebar is resizable and collapsible. Collapsed project folders show activity when one of their chats is running. Dark and light appearances, reduced motion, selectable transcripts, and keyboard navigation are supported. The conversation canvas is edge-to-edge, with a shared 768px reading column. Focus outlines are intentionally suppressed while keyboard focus and dialog trapping remain active.
 
+Project folders in the sidebar are sorted A–Z by folder name, ignoring case. Chat order within each folder is unchanged.
+
 Chat and settings layouts follow the installed Codex desktop reference where OMP has matching capabilities: compact 14px transcript text, rounded user bubbles, a neutral composer with visible model/effort selection, and grouped settings rows. Pico keeps its own neutral theme and 768px reading column. Settings retains native modal focus trapping and explicit saves for project/executable drafts. Codex-specific voice, cloud execution, hooks, billing modes, and permission selectors are not presented as working Pico controls.
 
 Scrollbars use slim, muted thumbs on transparent tracks in both appearances. Native wheel, keyboard, and thumb-drag scrolling remain available; the transcript keeps stable gutters to avoid layout shifts.
