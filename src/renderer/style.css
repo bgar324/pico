@@ -159,7 +159,7 @@ details > summary::marker { content:''; }
 .history-loading { padding-top:12px; font-size:12px; line-height:18px; }
 .conversation-content { padding-top:24px; padding-bottom:16px; }
 .message { margin-bottom:24px; min-width:0; overflow-wrap:anywhere; font-size:14px; line-height:1.625; }
-.user-message { position:relative; margin-left:auto; margin-bottom:40px; max-width:70%; width:fit-content; border-radius:22px; padding:10px 16px; background:var(--bubble); }
+.user-message { position:relative; margin-left:auto; margin-bottom:40px; max-width:100%; width:fit-content; border-radius:22px; padding:10px 16px; background:var(--bubble); }
 .user-message .markdown > :last-child { margin-bottom:0; }
 .user-message .markdown > :first-child { margin-top:0; }
 /* Keep the generous pointer target separate from the compact hover fill. */
@@ -171,7 +171,7 @@ details > summary::marker { content:''; }
 .user-message-action:hover:not(:disabled)::before { background:var(--hover); }
 .user-message:hover > .user-message-action,.user-message:focus-within > .user-message-action { opacity:1; pointer-events:auto; }
 @media(hover:none) { .user-message-action { opacity:1; pointer-events:auto; } }
-.user-message.is-editing { width:70%; border-radius:16px; }
+.user-message.is-editing { width:100%; border-radius:16px; }
 .user-message.is-editing > .markdown,.user-message.is-editing > .user-message-action { display:none; }
 .message-delivery { margin-top:4px; font-size:11px; line-height:18px; text-align:right; }
 .message-delivery > .error-text { margin:4px 0 0; font-size:12px; }

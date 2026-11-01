@@ -41,10 +41,10 @@ export function json(value: unknown, depth = 0): Json {
 }
 export function parseRequest(value: unknown): AppRequest {
   if (!record(value) || typeof value.kind !== 'string') throw new Error('Invalid app request.');
-  const text = (key: string): string => {
+  const text = (key: string, limit = 1_000_000): string => {
     const item = value[key];
     if (typeof item !== 'string' || item.includes('\0')) throw new Error(`Invalid ${key}.`);
-    if (item.length > 1_000_000) throw new Error(`${key} exceeds the input limit.`);
+    if (item.length > limit) throw new Error(`${key} exceeds the input limit.`);
     return item;
   };
   const boolean = (key: string): boolean => {
@@ -91,22 +91,22 @@ export function parseRequest(value: unknown): AppRequest {
     }
     case 'new-thread': return typeof value.projectPath === 'string' ? { kind: value.kind, projectPath: text('projectPath') } : { kind: value.kind };
     case 'select-thread': return typeof value.reopen === 'boolean' ? { kind: value.kind, id: text('id'), reopen: value.reopen } : { kind: value.kind, id: text('id') };
-    case 'draft': return { kind: value.kind, id: text('id'), text: text('text') };
+    case 'draft': return { kind: value.kind, id: text('id'), text: text('text', Infinity) };
     case 'prompt': {
       const images = imageFrames(value.images);
-      return { kind: value.kind, id: text('id'), message: text('message'), steer: boolean('steer'), images };
+      return { kind: value.kind, id: text('id'), message: text('message', Infinity), steer: boolean('steer'), images };
     }
     case 'abort': case 'delete-thread': case 'remove-project': case 'reveal-session': case 'terminal': case 'attach-images': case 'session-stats': return { kind: value.kind, id: text('id') };
     case 'model': return { kind: value.kind, id: text('id'), modelID: text('modelID') };
     case 'thinking': return { kind: value.kind, id: text('id'), level: text('level') };
     case 'copy-message': return { kind: value.kind, id: text('id'), messageID: text('messageID') };
-    case 'edit-message': return { kind: value.kind, id: text('id'), messageID: text('messageID'), message: text('message') };
-    case 'promote-queued': return { kind: value.kind, id: text('id'), message: text('message') };
+    case 'edit-message': return { kind: value.kind, id: text('id'), messageID: text('messageID'), message: text('message', Infinity) };
+    case 'promote-queued': return { kind: value.kind, id: text('id'), message: text('message', Infinity) };
     case 'retract-queued': {
       if (value.queue !== 'steering' && value.queue !== 'followUp') throw new Error('Choose a queued message to edit.');
       const imageRef = value.imageRef === null ? null : text('imageRef');
       if (imageRef !== null && (!imageRef || imageRef.length > 200)) throw new Error('Invalid queued image reference.');
-      return { kind: value.kind, id: text('id'), queue: value.queue, message: text('message'), imageRef };
+      return { kind: value.kind, id: text('id'), queue: value.queue, message: text('message', Infinity), imageRef };
     }
     case 'queued-images': {
       const imageRef = text('imageRef');

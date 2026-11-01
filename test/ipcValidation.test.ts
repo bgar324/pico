@@ -10,6 +10,26 @@ test('rejects unknown actions, malformed payloads and prototype mutation keys', 
   assert.throws(() => json({ number: Number.NaN }));
   assert.throws(() => parseRequest({ kind: 'add-project', path: '/tmp\0elsewhere' }));
 });
+
+test('long messages survive drafts, submission, branch editing and queue actions without truncation', () => {
+  const message = `${'Long message 雪\n'.repeat(80_000)}\n**Final paragraph**`;
+  const requests = [
+    { kind: 'draft', id: 'thread', text: message },
+    { kind: 'prompt', id: 'thread', message, steer: false, images: [] },
+    { kind: 'prompt', id: 'thread', message, steer: true, images: [] },
+    { kind: 'edit-message', id: 'thread', messageID: 'original', message },
+    { kind: 'promote-queued', id: 'thread', message },
+    { kind: 'retract-queued', id: 'thread', queue: 'steering', message, imageRef: null },
+  ];
+  for (const request of requests) {
+    assert.deepEqual(parseRequest(request), request);
+    assert.throws(() => parseRequest({ ...request, id: 'invalid\0thread' }));
+    const key = request.kind === 'draft' ? 'text' : 'message';
+    for (const invalid of [null, 1, 'invalid\0message']) {
+      assert.throws(() => parseRequest({ ...request, [key]: invalid }));
+    }
+  }
+});
 test('validates settings bounds and explicit booleans', () => {
   const preferences = { executableOverride: '', appearance: 'dark', defaultProjectPath: '', sidebarWidth: 244 };
   assert.deepEqual(parseRequest({ kind: 'preferences', preferences }), { kind: 'preferences', preferences });

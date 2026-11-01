@@ -24,6 +24,49 @@ async function complete(view: Conversation): Promise<void> {
   const deadline = performance.now() + 10000;
   while (view.content.getAttribute('aria-busy') === 'true') { verify(performance.now() < deadline, 'History loading did not complete.'); await frame(); }
 }
+
+export async function checkSentMessages(view: Conversation): Promise<string> {
+  const text = 'First line\nSecond line with **bold** and *emphasis*.\n\n## Heading\n\n- First item\n- Second item\n\n```text\n  indented code\n    next line\n```\n\nLast line';
+  const user: ChatMessage = { id: 'sent-format', role: 'user', text, thinking: '', toolIDs: [], error: null, isStreaming: false };
+  const runtime = { ...source('sent-messages'), messages: [user, { ...user, id: 'assistant-format', role: 'assistant' as const }] };
+  view.update(runtime, runtime.id);
+  await frame();
+  const body = (): HTMLElement => {
+    const node = view.content.querySelector<HTMLElement>('[data-message-id="sent-format"] > .markdown:not(.reasoning)');
+    if (!node) throw new Error('Sent message did not render.');
+    return node;
+  };
+  const formatted = (): void => {
+    const first = body().querySelector('p');
+    verify(first?.innerText === 'First line\nSecond line with bold and emphasis.', 'Sent message collapsed a single line break.');
+    verify(first?.querySelector('strong')?.textContent === 'bold' && first.querySelector('em')?.textContent === 'emphasis', 'Sent message lost inline Markdown formatting.');
+    verify(body().querySelector('h2')?.textContent === 'Heading' && body().querySelectorAll('li').length === 2, 'Sent message lost heading/list structure.');
+    verify(body().querySelector('pre code')?.textContent === '  indented code\n    next line\n', 'Sent message changed code indentation or line breaks.');
+  };
+  formatted();
+  verify(!view.content.querySelector('[data-message-id="assistant-format"] p br'), 'User line-break handling changed assistant Markdown.');
+  const long = 'Complete sent message content. '.repeat(4000) + 'FINAL_SENT_MARKER';
+  view.update({ ...runtime, revision: 2, messages: [{ ...user, text: long }] }, runtime.id);
+  await frame();
+  verify(body().textContent?.trim() === long, 'Sent message truncated long content.');
+  const bubble = body().parentElement;
+  if (!bubble) throw new Error('Missing sent bubble.');
+  const content = view.content.getBoundingClientRect(), style = getComputedStyle(view.content);
+  const available = content.width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  verify(Math.abs(bubble.getBoundingClientRect().width - available) < 1, 'Long sent message remains narrower than the reading column.');
+  const bounds = bubble.getBoundingClientRect(), textBounds = body().getBoundingClientRect();
+  verify(textBounds.top >= bounds.top && textBounds.bottom <= bounds.bottom && view.scroll.scrollWidth <= view.scroll.clientWidth + 1, 'Long sent message clips vertically or overflows the conversation.');
+  view.update({ ...runtime, revision: 3, messages: [user] }, runtime.id);
+  formatted();
+  view.activate();
+  view.update({ ...runtime, revision: 4, messages: [user] }, runtime.id);
+  formatted();
+  view.update({ ...runtime, revision: 5, messages: [{ ...user, text: 'Short message' }] }, runtime.id);
+  await frame();
+  verify((body().parentElement?.getBoundingClientRect().width ?? Infinity) < available / 2, 'Short sent message no longer fits its content.');
+  view.update({ ...runtime, revision: 6, messages: [user] }, runtime.id);
+  return 'Sent messages preserve line breaks and Markdown on initial render, updates and reactivation; long bubbles fill the reading column without clipping, and short bubbles remain compact.';
+}
 function checkNotices(view: Conversation): string[] {
   const reminder = '<system-reminder>Eval runtime state is host-retained, not reconstructed from transcript text. No retained eval runtime is registered in this process.</system-reminder>';
   const imitation = 'Background job example has completed. Resume your work using the result below.\nOrdinary assistant wording.';
@@ -801,6 +844,7 @@ export async function checkLoadingBehavior(): Promise<string[]> {
     outcomes.push(await checkStreamingPresentation(view, source('adaptive-streaming')));
     outcomes.push(await checkAdvisorDisclosure(view));
     outcomes.push(checkTodoActivity(view));
+    outcomes.push(await checkSentMessages(view));
     outcomes.push(checkActivityPresentation(view));
     outcomes.push(await checkToolLabels(view));
     outcomes.push(await checkTranscriptSpacing(view));

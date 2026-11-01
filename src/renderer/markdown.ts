@@ -173,8 +173,8 @@ export function reconcileChildren(target: HTMLElement, source: HTMLElement, stre
   }
 }
 
-export function renderMarkdown(target: HTMLElement, text: string, streaming = false): void {
-  const parsed = markdown.parse(text, { async: false, gfm: true, breaks: false });
+export function renderMarkdown(target: HTMLElement, text: string, streaming = false, { breaks = false }: { breaks?: boolean } = {}): void {
+  const parsed = markdown.parse(text, { async: false, gfm: true, breaks });
   const safe = DOMPurify.sanitize(parsed, {
     ALLOWED_TAGS: ['p', 'br', 'hr', 'strong', 'em', 'del', 'blockquote', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'code', 'a', 'table', 'thead', 'tbody', 'tr', 'th', 'td'],
     ALLOWED_ATTR: ['href', 'title', 'class', 'start'],

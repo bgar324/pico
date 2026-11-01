@@ -320,15 +320,15 @@ export class Conversation {
         }
         view = { node, body, images, reasoning, error, delivery, deliveryStatus, historicalEdit, value: message, advisors }; this.messages.set(message.id, view);
         if (message.text || message.customType) {
-          if (!renderBackgroundMessage(body, message, advisors)) this.renderText(body, message.text, streaming && this.hydrated);
+          if (!renderBackgroundMessage(body, message, advisors)) this.renderText(body, message.text, streaming && this.hydrated, { breaks: message.role === 'user' });
         }
         if (message.thinking) this.renderText(reasoning, message.thinking, streaming && this.hydrated);
       } else if (changed) {
         if (advisorsChanged || view.value.text !== message.text || view.value.isStreaming !== message.isStreaming || view.value.role !== message.role || view.value.customType !== message.customType || view.value.details !== message.details) {
-          if (!renderBackgroundMessage(view.body, message, advisors)) this.renderText(view.body, message.text, streaming, view.value.isStreaming ? view.value.text : message.text);
+          if (!renderBackgroundMessage(view.body, message, advisors)) this.renderText(view.body, message.text, streaming, { previousText: view.value.isStreaming ? view.value.text : message.text, breaks: message.role === 'user' });
           else this.stopTextStream(view.body);
         }
-        if (view.value.thinking !== message.thinking || view.value.isStreaming !== message.isStreaming) this.renderText(view.reasoning, message.thinking, streaming, view.value.isStreaming ? view.value.thinking : message.thinking);
+        if (view.value.thinking !== message.thinking || view.value.isStreaming !== message.isStreaming) this.renderText(view.reasoning, message.thinking, streaming, { previousText: view.value.isStreaming ? view.value.thinking : message.thinking });
         view.value = message;
         view.advisors = advisors;
       }
@@ -422,19 +422,19 @@ export class Conversation {
     for (const stream of this.textStreams.values()) { if (flush) stream.flush(); else stream.destroy(); }
     this.textStreams.clear();
   }
-  private renderText(target: HTMLElement, text: string, streaming: boolean, previousText = text): void {
+  private renderText(target: HTMLElement, text: string, streaming: boolean, { previousText = text, breaks = false }: { previousText?: string; breaks?: boolean } = {}): void {
     const animate = streaming && !this.reducedMotion.matches && !document.hidden;
     if (!animate) {
       this.stopTextStream(target);
-      renderMarkdown(target, text);
+      renderMarkdown(target, text, false, { breaks });
       return;
     }
     let stream = this.textStreams.get(target);
     if (!stream) {
-      if (previousText === text) renderMarkdown(target, text, true);
+      if (previousText === text) renderMarkdown(target, text, true, { breaks });
       stream = new StreamingText(previousText, value => {
         const top = this.scroll.scrollTop;
-        renderMarkdown(target, value, this.node.isConnected && !this.reducedMotion.matches && !document.hidden);
+        renderMarkdown(target, value, this.node.isConnected && !this.reducedMotion.matches && !document.hidden, { breaks });
         if (this.query) this.refreshFind(false);
         if (this.follow || this.restoringBottom) this.positionBottom(this.threadID);
         else this.scroll.scrollTop = top;
