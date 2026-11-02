@@ -24,7 +24,6 @@ for size in [16, 32, 128, 256, 512] {
         NSGraphicsContext.current = context
         let side = Double(pixels)
         let tile = NSRect(x: side * 0.08, y: side * 0.08, width: side * 0.84, height: side * 0.84)
-        NSBezierPath(roundedRect: tile, xRadius: side * 0.185, yRadius: side * 0.185).addClip()
         context.imageInterpolation = .high
         artwork.draw(in: tile, from: .zero, operation: .copy, fraction: 1)
         NSGraphicsContext.restoreGraphicsState()
