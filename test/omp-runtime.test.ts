@@ -1774,7 +1774,8 @@ test('queue removal before hook-rewritten native delivery preserves FIFO duplica
   await r.sendPrompt('same', { steer: true, images: [secondImage] });
   const second = r.snapshot().messages.filter(message => message.delivery)[1]; assert.ok(second);
   await r.client.request('deliver_queued', { queue: 'steering', hold: true, text: 'Hook changed the first steer' });
-  assert.equal(r.snapshot().messages.filter(message => message.delivery).length, 1);
+  assert.equal(r.snapshot().messages.some(message => message.error), false, 'Dequeuing an in-flight steer must not report a delivery failure.');
+  assert.deepEqual(r.snapshot().messages.filter(message => message.delivery).map(message => message.images), [[firstImage], [secondImage]]);
   assert.equal(r.snapshot().messages.find(message => message.id === second.id)?.delivery?.imageRef, r.summary().queuedSteers[0]?.imageRef);
   await r.client.request('release_queue_delivery');
   const delivered = r.snapshot().messages.find(message => message.id === 'delivered-queue-1');
@@ -2010,6 +2011,68 @@ test('consumed duplicate reservations cannot remove another promotion already re
   assert.deepEqual(r.summary().queuedSteers.map(entry => entry.text), ['same']);
 });
 
+for (const direct of [true, false]) for (const skill of [false, true]) test(`settlement before late ${direct ? 'direct' : 'promoted'} ${skill ? 'skill' : 'user'} delivery replaces the projection exactly once`, async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime; await r.connect(f.executable);
+  const images: ImageContent[] = direct ? [] : [{ type: 'image', mimeType: 'image/png', data: 'AA==' }];
+  const text = skill ? '/skill:example argument' : 'Why is the font so massive?\n\nhttps://www.rachelchen.tech/\n\nAdopt her font size please.';
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt(text, { steer: direct, images });
+  if (!direct) assert.equal(await r.promoteQueued(text), true);
+  const projection = r.snapshot().messages.find(message => message.delivery); assert.ok(projection);
+  await r.client.request('deliver_queued', { queue: 'steering', hold: true, skill });
+  assert.equal(r.snapshot().messages.find(message => message.id === projection.id)?.error, null);
+  await r.client.request('finish_native_turn'); await r.refreshState();
+  assert.ok(r.snapshot().messages.find(message => message.id === projection.id)?.error);
+  await r.client.request('emit_event', { frame: { type: 'agent_start' } });
+  await r.client.request('release_queue_delivery');
+  const delivered = r.snapshot().messages.filter(message => message.text === text);
+  assert.deepEqual(delivered.map(message => [message.id, message.images, message.error, message.delivery]), [['delivered-queue-1', images, null, undefined]]);
+  assert.equal(f.cache.get(f.record.id)?.messages.some(message => message.id === projection.id), false);
+  await r.client.request('emit_event', { frame: { type: 'message_end', messageId: 'delivered-queue-1', message: { role: 'user', content: text } } });
+  assert.equal(r.snapshot().messages.some(message => message.id === projection.id), false);
+  assert.equal((await commands(f.root)).filter(frame => frame.type === 'prompt' && frame.message === text).length, 1);
+});
+
+test('late confirmation after settlement requires matching text and exact image identity, not FIFO fallback', async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime; await r.connect(f.executable);
+  const firstImage: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  const secondImage: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AQ==' };
+  await r.sendPrompt('Working turn');
+  await r.sendPrompt('same', { steer: true, images: [firstImage] });
+  await r.sendPrompt('same', { steer: true, images: [secondImage] });
+  const projections = r.snapshot().messages.filter(message => message.delivery);
+  await r.client.request('clear_queued'); await r.client.request('finish_native_turn'); await r.refreshState();
+  const deliver = async (id: string, text: string, images: ImageContent[]) => r.client.request('emit_event', { frame: { type: 'message_start', messageId: id, message: { role: 'user', steering: true, content: [{ type: 'text', text }, ...images] } } });
+  await deliver('unrelated', 'Different native input', [firstImage]);
+  await deliver('wrong-image', 'same', [{ type: 'image', mimeType: 'image/png', data: 'Ag==' }]);
+  assert.ok(projections.every(projection => r.snapshot().messages.find(message => message.id === projection.id)?.error));
+  await deliver('second', 'same', [secondImage]);
+  assert.ok(r.snapshot().messages.find(message => message.id === projections[0]?.id)?.error);
+  assert.equal(r.snapshot().messages.some(message => message.id === projections[1]?.id), false);
+  await deliver('first', 'same', [firstImage]);
+  assert.equal(r.snapshot().messages.some(message => message.id.startsWith('pending-steer-')), false);
+  assert.deepEqual(f.cache.get(f.record.id)?.messages.filter(message => ['first', 'second'].includes(message.id)).map(message => [message.id, message.images]), [['second', [secondImage]], ['first', [firstImage]]]);
+});
+
+for (const busy of [false, true]) test(`a new ${busy ? 'busy steer' : 'idle submission'} with identical content cannot erase a settled undelivered steer`, async t => {
+  const f = await fixture(t, { history: 'empty', nativeQueues: true });
+  const r = f.runtime; await r.connect(f.executable);
+  const image: ImageContent = { type: 'image', mimeType: 'image/png', data: 'AA==' };
+  await r.sendPrompt('Working turn'); await r.sendPrompt('same', { steer: true, images: [image] });
+  const projection = r.snapshot().messages.find(message => message.delivery); assert.ok(projection);
+  await r.client.request('clear_queued'); await r.client.request('finish_native_turn'); await r.refreshState();
+  if (busy) await r.client.request('emit_event', { frame: { type: 'agent_start' } });
+  await r.sendPrompt('same', { steer: busy, images: [image] });
+  if (busy) await r.client.request('deliver_queued', { queue: 'steering' });
+  else await r.client.request('emit_event', { frame: { type: 'message_start', messageId: 'new-user', message: { role: 'user', content: [{ type: 'text', text: 'same' }, image] } } });
+  const retained = r.snapshot().messages.find(message => message.id === projection.id);
+  assert.ok(retained?.error); assert.deepEqual(retained.images, [image]);
+  assert.equal(r.snapshot().messages.filter(message => message.text === 'same' && !message.error && !message.delivery).length, 1);
+  assert.equal(r.snapshot().messages.some(message => message.delivery), false);
+});
+
 test('native delivery after an intervening empty-queue state read still replaces its projection once', async t => {
   const f = await fixture(t, { history: 'empty', nativeQueues: true });
   const r = f.runtime; await r.connect(f.executable);
@@ -2060,6 +2123,8 @@ for (const status of ['aborted', 'error'] as const) test(`terminal ${status} que
   await r.refreshState();
   const retained = r.snapshot().messages.find(message => message.text === 'Cancelled steer');
   assert.ok(retained?.error); assert.equal(retained.delivery, undefined); assert.deepEqual(retained.images, [image]);
+  await r.client.request('emit_event', { frame: { type: 'message_start', messageId: 'later-identical', message: { role: 'user', steering: true, content: [{ type: 'text', text: 'Cancelled steer' }, image] } } });
+  assert.ok(r.snapshot().messages.find(message => message.id === retained.id)?.error, 'A terminal failure must not become late-confirmable.');
 });
 
 test('Stop retains an accepted steer dropped by native abort without showing false acceptance', async t => {
@@ -2074,6 +2139,8 @@ test('Stop retains an accepted steer dropped by native abort without showing fal
   const retained = r.snapshot().messages.find(message => message.text === 'Stopped steer');
   assert.ok(retained?.error); assert.equal(retained.delivery, undefined); assert.deepEqual(retained.images, [image]);
   assert.equal((await commands(f.root)).filter(frame => frame.type === 'prompt' && frame.message === 'Stopped steer').length, 1);
+  await r.client.request('emit_event', { frame: { type: 'message_start', messageId: 'after-stop', message: { role: 'user', steering: true, content: [{ type: 'text', text: 'Stopped steer' }, image] } } });
+  assert.ok(r.snapshot().messages.find(message => message.id === retained.id)?.error, 'Stop must permanently end late attribution.');
 });
 
 for (const closure of ['shutdown', 'transport_error'] as const) test(`${closure} retains accepted and unresolved steer payloads locally without replay`, async t => {

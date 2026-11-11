@@ -19,7 +19,7 @@ interface QueuedDelivery {
   queue: 'steering' | 'followUp';
   text: string;
   images: readonly ImageContent[];
-  state: 'pending' | 'queued' | 'removed' | 'dropped' | 'delivered';
+  state: 'pending' | 'queued' | 'removed' | 'unconfirmed' | 'dropped' | 'delivered';
   projection: (ChatMessage & { delivery: NonNullable<ChatMessage['delivery']> }) | null;
   promotionID: string | null;
   withdrawn: boolean;
@@ -88,7 +88,7 @@ export class ThreadRuntime {
     const projected = this.queuedDeliveries.flatMap<ChatMessage>(delivery => {
       const message = delivery.projection;
       if (!message || delivery.state === 'delivered' || delivery.withdrawn) return [];
-      if (delivery.state !== 'removed' && delivery.state !== 'dropped') return [message];
+      if (delivery.state !== 'unconfirmed' && delivery.state !== 'dropped') return [message];
       if (message.delivery.status !== 'accepted') return [];
       const { delivery: _, ...retained } = message;
       return [{ ...retained, error: 'Steer left the native queue before delivery was confirmed. Your original message is kept here and was not resent.' }];
@@ -303,6 +303,9 @@ export class ThreadRuntime {
   private async submitPrompt(message: string, options: { steer?: boolean; images?: JsonRecord[] } = {}): Promise<boolean> {
     if (!isReady(this.state.status) || (!message.trim() && !options.images?.length)) return false;
     const generation = this.generation, id = randomUUID(), busy = isBusy(this.state.status);
+    // A new submission ends attribution for an earlier settled queue. Equal text
+    // in this turn must not erase a genuinely undelivered message from that turn.
+    for (const delivery of this.queuedDeliveries) if (delivery.state === 'unconfirmed') delivery.state = 'dropped';
     const images = options.images?.filter(isImageContent) ?? [];
     this.lifecycleEpoch++;
     if (busy) {
@@ -884,15 +887,17 @@ export class ThreadRuntime {
     const content = frame.message.content;
     const text = typeof content === 'string' ? content : Array.isArray(content) ? content.flatMap(block => isRecord(block) && block.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n\n') : '';
     const images = Array.isArray(content) ? content.filter(isImageContent) : [];
-    const candidates = this.queuedDeliveries.filter(delivery => delivery.state !== 'delivered' && delivery.state !== 'dropped').sort((left, right) => Number(left.queue === 'followUp') - Number(right.queue === 'followUp'));
-    // Queue removal can precede native delivery, including an intervening state
-    // read. Only settlement or a terminal result ends FIFO attribution.
+    const candidates = this.queuedDeliveries.filter(delivery => delivery.state === 'pending' || delivery.state === 'queued' || delivery.state === 'removed').sort((left, right) => Number(left.queue === 'followUp') - Number(right.queue === 'followUp'));
+    // Queue removal is not a delivery failure. Settlement ends FIFO attribution,
+    // but an exact late delivery can still confirm it until the next submission.
     const removed = candidates.filter(delivery => delivery.state === 'removed');
-    const sameContent = (delivery: QueuedDelivery): boolean => delivery.text === text && delivery.images.length === images.length &&
+    const sameImages = (delivery: QueuedDelivery): boolean => delivery.images.length === images.length &&
       delivery.images.every((image, index) => image.mimeType === images[index]?.mimeType && image.data === images[index]?.data);
+    const sameContent = (delivery: QueuedDelivery): boolean => delivery.text === text && sameImages(delivery);
     const matchesSkill = (delivery: QueuedDelivery): boolean => (delivery.entry?.chip ?? delivery.text) === skillChip;
-    const delivery = skillChip !== null ? removed.find(matchesSkill) ?? candidates.find(matchesSkill) :
-      removed.find(sameContent) ?? candidates.find(sameContent) ?? removed[0] ??
+    const late = this.optimisticPrompt ? undefined : this.queuedDeliveries.find(delivery => delivery.state === 'unconfirmed' && (skillChip !== null ? matchesSkill(delivery) && sameImages(delivery) : sameContent(delivery)));
+    const delivery = skillChip !== null ? removed.find(matchesSkill) ?? candidates.find(matchesSkill) ?? late :
+      removed.find(sameContent) ?? candidates.find(sameContent) ?? late ?? removed[0] ??
         (!this.optimisticPrompt || frame.message.steering === true ? candidates.find(item => item.queue === 'steering') ?? candidates.find(item => item.state === 'queued') : undefined);
     if (!delivery) return false;
     delivery.state = 'delivered';
@@ -953,7 +958,7 @@ export class ThreadRuntime {
   private settle(): void {
     let retired = false;
     for (const delivery of this.queuedDeliveries) if (delivery.state === 'removed' || (delivery.state === 'pending' && delivery.projection?.delivery.status === 'accepted')) {
-      delivery.state = 'dropped';
+      delivery.state = this.activity === 'stopping' ? 'dropped' : 'unconfirmed';
       retired ||= delivery.projection !== null;
     }
     if (retired) this.messagesChanged();
